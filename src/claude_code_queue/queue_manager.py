@@ -4,8 +4,7 @@ Queue manager with execution loop.
 
 import time
 import signal
-import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Optional, Callable, Dict, Any
 
 from .models import QueuedPrompt, QueueState, PromptStatus, ExecutionResult
@@ -90,7 +89,18 @@ class QueueManager:
         self, callback: Optional[Callable[[QueueState], None]] = None
     ) -> None:
         """Process one iteration of the queue."""
+        previous_total_processed = self.state.total_processed if self.state else 0
+        previous_failed_count = self.state.failed_count if self.state else 0
+        previous_rate_limited_count = self.state.rate_limited_count if self.state else 0
+        previous_last_processed = self.state.last_processed if self.state else None
+        
         self.state = self.storage.load_queue_state()
+        
+        self.state.total_processed = max(self.state.total_processed, previous_total_processed)
+        self.state.failed_count = max(self.state.failed_count, previous_failed_count)
+        self.state.rate_limited_count = max(self.state.rate_limited_count, previous_rate_limited_count)
+        if previous_last_processed and (not self.state.last_processed or self.state.last_processed < previous_last_processed):
+            self.state.last_processed = previous_last_processed
 
         self._check_rate_limited_prompts()
 
@@ -302,7 +312,6 @@ class QueueManager:
             "prompts": [],
         }
 
-        # Add rate-limited prompt info
         for prompt in rate_limited_prompts:
             info["prompts"].append(
                 {

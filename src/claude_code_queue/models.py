@@ -157,9 +157,17 @@ class QueueState:
         """Get queue statistics."""
         status_counts = {}
         for status in PromptStatus:
-            status_counts[status.value] = len(
-                [p for p in self.prompts if p.status == status]
-            )
+            if status == PromptStatus.COMPLETED:
+                # Use persistent counter for completed prompts
+                status_counts[status.value] = self.total_processed
+            elif status == PromptStatus.FAILED:
+                # Use persistent counter for failed prompts
+                status_counts[status.value] = self.failed_count
+            else:
+                # Count active prompts for other statuses
+                status_counts[status.value] = len(
+                    [p for p in self.prompts if p.status == status]
+                )
 
         return {
             "total_prompts": len(self.prompts),
