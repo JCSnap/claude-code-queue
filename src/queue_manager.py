@@ -5,8 +5,8 @@ Queue manager with execution loop.
 import time
 import signal
 import sys
-from datetime import datetime, timedelta
-from typing import Optional, Callable
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Callable, Dict, Any
 
 from .models import QueuedPrompt, QueueState, PromptStatus, ExecutionResult
 from .storage import QueueStorage
@@ -276,3 +276,118 @@ class QueueManager:
         """Create a prompt template file."""
         file_path = self.storage.create_prompt_template(filename, priority)
         return str(file_path)
+    
+    def get_next_reset_time(self) -> Optional[datetime]:
+        """Get the next rate limit reset time using Claude monitor's method."""
+        try:
+            reset_time = self._get_reset_time_from_claude_data()
+            if reset_time:
+                return reset_time
+        except Exception as e:
+            print(f"Could not get reset time from Claude data: {e}")
+        
+        if not self.state:
+            self.state = self.storage.load_queue_state()
+        
+        rate_limited_prompts = [p for p in self.state.prompts if p.status == PromptStatus.RATE_LIMITED]
+        if rate_limited_prompts:
+            reset_times = [p.reset_time for p in rate_limited_prompts if p.reset_time]
+            if reset_times:
+                earliest_reset = min(reset_times)
+                current_time = datetime.now()
+                if earliest_reset > current_time:
+                    return earliest_reset
+        
+        return datetime.now() + timedelta(hours=5)
+    
+    def _get_reset_time_from_claude_data(self) -> Optional[datetime]:
+        """Get reset time from actual Claude usage data, like the monitor does."""
+        import sys
+        import os
+        
+        monitor_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'Claude-Code-Usage-Monitor')
+        if os.path.exists(monitor_path):
+            sys.path.insert(0, monitor_path)
+            from usage_analyzer.api import analyze_usage
+            
+            data = analyze_usage()
+            if data and "blocks" in data:
+                for block in data["blocks"]:
+                    if block.get("isActive", False):
+                        end_time_str = block.get("endTime")
+                        if end_time_str:
+                            reset_time = datetime.fromisoformat(end_time_str.replace("Z", "+00:00"))
+                            return reset_time.astimezone().replace(tzinfo=None)
+                        
+                if data["blocks"]:
+                    latest_block = max(data["blocks"], key=lambda b: b.get("startTime", ""))
+                    end_time_str = latest_block.get("endTime")
+                    if end_time_str:
+                        reset_time = datetime.fromisoformat(end_time_str.replace("Z", "+00:00"))
+                        current_time = datetime.now()
+                        reset_local = reset_time.astimezone().replace(tzinfo=None)
+                        if reset_local <= current_time:
+                            current_utc = datetime.now(timezone.utc)
+                            current_hour_utc = current_utc.replace(minute=0, second=0, microsecond=0)
+                            next_reset_utc = current_hour_utc + timedelta(hours=5)
+                            return next_reset_utc.astimezone().replace(tzinfo=None)
+                        else:
+                            return reset_local
+        
+        return None
+    
+    def get_rate_limit_info(self) -> Dict[str, Any]:
+        """Get detailed rate limit information for testing."""
+        if not self.state:
+            self.state = self.storage.load_queue_state()
+        
+        current_time = datetime.now()
+        rate_limited_prompts = [p for p in self.state.prompts if p.status == PromptStatus.RATE_LIMITED]
+        
+        info = {
+            "current_time": current_time,
+            "has_rate_limited_prompts": len(rate_limited_prompts) > 0,
+            "rate_limited_count": len(rate_limited_prompts),
+            "next_reset_time": None,
+            "time_until_reset": None,
+            "prompts": [],
+            "session_info": None
+        }
+        
+        next_reset = self.get_next_reset_time()
+        if next_reset:
+            info["next_reset_time"] = next_reset
+            
+            try:
+                reset_from_claude = self._get_reset_time_from_claude_data()
+                if reset_from_claude and reset_from_claude == next_reset:
+                    info["session_info"] = {
+                        "status": "active",
+                        "source": "claude_monitor_data"
+                    }
+                else:
+                    info["session_info"] = {
+                        "status": "fallback",
+                        "source": "estimated"
+                    }
+            except:
+                info["session_info"] = {
+                    "status": "fallback", 
+                    "source": "estimated"
+                }
+        
+        for prompt in rate_limited_prompts:
+            info["prompts"].append({
+                "id": prompt.id,
+                "reset_time": prompt.reset_time,
+                "rate_limited_at": prompt.rate_limited_at,
+                "retry_count": prompt.retry_count,
+                "max_retries": prompt.max_retries
+            })
+        
+        if info["next_reset_time"]:
+            time_diff = (info["next_reset_time"] - current_time).total_seconds()
+            info["time_until_reset"] = time_diff
+            info["time_until_reset_formatted"] = self._format_duration(time_diff)
+        
+        return info

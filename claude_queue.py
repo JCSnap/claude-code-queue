@@ -96,6 +96,10 @@ Examples:
     
     test_parser = subparsers.add_parser('test', help='Test Claude Code connection')
     
+    # Reset time command
+    reset_parser = subparsers.add_parser('reset-time', help='Show next rate limit reset time')
+    reset_parser.add_argument('--detailed', '-d', action='store_true', help='Show detailed rate limit info')
+    
     args = parser.parse_args()
     
     if not args.command:
@@ -124,6 +128,8 @@ Examples:
             return cmd_list(manager, args)
         elif args.command == 'test':
             return cmd_test(manager, args)
+        elif args.command == 'reset-time':
+            return cmd_reset_time(manager, args)
         else:
             print(f"Unknown command: {args.command}")
             return 1
@@ -280,6 +286,88 @@ def cmd_test(manager: QueueManager, args) -> int:
     is_working, message = manager.claude_interface.test_connection()
     print(message)
     return 0 if is_working else 1
+
+
+def cmd_reset_time(manager: QueueManager, args) -> int:
+    """Show next rate limit reset time."""
+    if args.detailed:
+        info = manager.get_rate_limit_info()
+        
+        print("Rate Limit Information")
+        print("=" * 40)
+        print(f"Current time: {info['current_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Rate limited prompts: {info['rate_limited_count']}")
+        
+        if info['has_rate_limited_prompts']:
+            if info['next_reset_time']:
+                print(f"Next reset time: {info['next_reset_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"Time until reset: {info['time_until_reset_formatted']}")
+                
+                if info['time_until_reset'] <= 0:
+                    print("⚠️  Reset time has passed - prompts should be ready!")
+                else:
+                    print(f"⏰ Waiting {info['time_until_reset_formatted']} until reset")
+            else:
+                print("❌ No reset times found for rate limited prompts")
+            
+            print("\nRate Limited Prompts:")
+            print("-" * 40)
+            for prompt_info in info['prompts']:
+                print(f"ID: {prompt_info['id']}")
+                if prompt_info['reset_time']:
+                    print(f"  Reset time: {prompt_info['reset_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+                if prompt_info['rate_limited_at']:
+                    print(f"  Rate limited at: {prompt_info['rate_limited_at'].strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"  Retries: {prompt_info['retry_count']}/{prompt_info['max_retries']}")
+                print()
+        else:
+            print("✅ No rate limited prompts found")
+        
+        import json
+        
+        json_info = info.copy()
+        json_info['current_time'] = info['current_time'].isoformat()
+        if info['next_reset_time']:
+            json_info['next_reset_time'] = info['next_reset_time'].isoformat()
+        
+        if info.get('session_info'):
+            json_info['session_info'] = info['session_info'].copy()
+            for key, value in json_info['session_info'].items():
+                if isinstance(value, datetime):
+                    json_info['session_info'][key] = value.isoformat()
+        
+        for prompt in json_info['prompts']:
+            if prompt.get('reset_time'):
+                prompt['reset_time'] = prompt['reset_time'].isoformat()
+            if prompt.get('rate_limited_at'):
+                prompt['rate_limited_at'] = prompt['rate_limited_at'].isoformat()
+        
+    else:
+        next_reset = manager.get_next_reset_time()
+        
+        if next_reset:
+            current_time = datetime.now()
+            time_diff = (next_reset - current_time).total_seconds()
+            
+            print(f"Next reset time: {next_reset.strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            if time_diff <= 0:
+                print("⚠️  Reset time has passed - prompts should be ready!")
+            else:
+                if time_diff < 60:
+                    duration = f"{int(time_diff)}s"
+                elif time_diff < 3600:
+                    duration = f"{int(time_diff // 60)}m"
+                else:
+                    hours = int(time_diff // 3600)
+                    minutes = int((time_diff % 3600) // 60)
+                    duration = f"{hours}h {minutes}m" if minutes > 0 else f"{hours}h"
+                
+                print(f"Time until reset: {duration}")
+        else:
+            print("No rate limited prompts found")
+    
+    return 0
 
 
 if __name__ == "__main__":
