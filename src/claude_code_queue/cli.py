@@ -5,314 +5,239 @@ Claude Code Queue - Main CLI entry point.
 A tool to queue Claude Code prompts and automatically execute them when token limits reset.
 """
 
-import argparse
 import json
 from datetime import datetime
+from typing import List, Optional
+
+import typer
+from typing_extensions import Annotated
 
 from .queue_manager import QueueManager
 from .models import QueuedPrompt, PromptStatus
 
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Claude Code Queue - Queue prompts and execute when limits reset",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+app = typer.Typer(
+    name="python -m claude_code_queue.cli",
+    help="Claude Code Queue - Queue prompts and execute when limits reset.",
+    rich_markup_mode="markdown",
+    epilog="""
 Examples:
+  \b
   # Start the queue processor
   python -m claude_code_queue.cli start
-
+  \b
   # Add a quick prompt
   python -m claude_code_queue.cli add "Fix the authentication bug" --priority 1
-
+  \b
   # Create a template for detailed prompt
   python -m claude_code_queue.cli template my-feature --priority 2
-
+  \b
   # Check queue status
   python -m claude_code_queue.cli status
-
+  \b
   # Cancel a prompt
   python -m claude_code_queue.cli cancel abc123
-
-  # Test Claude Code connection  
+  \b
+  # Test Claude Code connection
   python -m claude_code_queue.cli test
-        """,
-    )
+    """,
+)
 
-    parser.add_argument(
-        "--storage-dir",
-        default="~/.claude-queue",
-        help="Storage directory for queue data (default: ~/.claude-queue)",
-    )
+# Shared state object to hold the QueueManager instance
+state = {}
 
-    parser.add_argument(
-        "--claude-command",
-        default="claude",
-        help="Claude Code CLI command (default: claude)",
-    )
+@app.callback()
+def main(
+    ctx: typer.Context,
+    storage_dir: Annotated[str, typer.Option(help="Storage directory for queue data.")] = "~/.claude-queue",
+    claude_command: Annotated[str, typer.Option(help="Claude Code CLI command.")] = "claude",
+    check_interval: Annotated[int, typer.Option(help="Check interval in seconds.")] = 30,
+    timeout: Annotated[int, typer.Option(help="Command timeout in seconds.")] = 3600,
+):
+    """
+    Claude Code Queue - A tool to queue Claude Code prompts and automatically execute them when token limits reset.
+    """
+    try:
+        # Store manager instance in the shared state object
+        state["manager"] = QueueManager(
+            storage_dir=storage_dir,
+            claude_command=claude_command,
+            check_interval=check_interval,
+            timeout=timeout,
+        )
+    except Exception as e:
+        typer.secho(f"Error initializing: {e}", fg=typer.colors.RED)
+        raise typer.Exit(1)
 
-    parser.add_argument(
-        "--check-interval",
-        type=int,
-        default=30,
-        help="Check interval in seconds (default: 30)",
-    )
 
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=3600,
-        help="Command timeout in seconds (default: 3600)",
-    )
-
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
-
-    start_parser = subparsers.add_parser("start", help="Start the queue processor")
-    start_parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Verbose output"
-    )
-
-    add_parser = subparsers.add_parser("add", help="Add a prompt to the queue")
-    add_parser.add_argument("prompt", help="The prompt text")
-    add_parser.add_argument(
-        "--priority",
-        "-p",
-        type=int,
-        default=0,
-        help="Priority (lower = higher priority)",
-    )
-    add_parser.add_argument(
-        "--working-dir", "-d", default=".", help="Working directory"
-    )
-    add_parser.add_argument(
-        "--context-files", "-f", nargs="*", default=[], help="Context files to include"
-    )
-    add_parser.add_argument(
-        "--max-retries", "-r", type=int, default=3, help="Maximum retry attempts"
-    )
-    add_parser.add_argument(
-        "--estimated-tokens", "-t", type=int, help="Estimated token usage"
-    )
-
-    template_parser = subparsers.add_parser(
-        "template", help="Create a prompt template file"
-    )
-    template_parser.add_argument(
-        "filename", help="Template filename (without .md extension)"
-    )
-    template_parser.add_argument(
-        "--priority", "-p", type=int, default=0, help="Default priority"
-    )
-
-    status_parser = subparsers.add_parser("status", help="Show queue status")
-    status_parser.add_argument("--json", action="store_true", help="Output as JSON")
-    status_parser.add_argument(
-        "--detailed", "-d", action="store_true", help="Show detailed prompt info"
-    )
-
-    cancel_parser = subparsers.add_parser("cancel", help="Cancel a prompt")
-    cancel_parser.add_argument("prompt_id", help="Prompt ID to cancel")
-
-    list_parser = subparsers.add_parser("list", help="List prompts")
-    list_parser.add_argument(
-        "--status", choices=[s.value for s in PromptStatus], help="Filter by status"
-    )
-    list_parser.add_argument("--json", action="store_true", help="Output as JSON")
-
-    test_parser = subparsers.add_parser("test", help="Test Claude Code connection")
-
-    args = parser.parse_args()
-
-    if not args.command:
-        parser.print_help()
-        return 1
+@app.command()
+def start(
+    verbose: Annotated[bool, typer.Option("-v", "--verbose", help="Verbose output.")] = False
+):
+    """Start the queue processor."""
+    manager: QueueManager = state["manager"]
+    status_callback = None
+    if verbose:
+        def callback(q_state):
+            stats = q_state.get_stats()
+            typer.echo(f"Queue status: {stats['status_counts']}")
+        status_callback = callback
 
     try:
-        manager = QueueManager(
-            storage_dir=args.storage_dir,
-            claude_command=args.claude_command,
-            check_interval=args.check_interval,
-            timeout=args.timeout,
-        )
-
-        if args.command == "start":
-            return cmd_start(manager, args)
-        elif args.command == "add":
-            return cmd_add(manager, args)
-        elif args.command == "template":
-            return cmd_template(manager, args)
-        elif args.command == "status":
-            return cmd_status(manager, args)
-        elif args.command == "cancel":
-            return cmd_cancel(manager, args)
-        elif args.command == "list":
-            return cmd_list(manager, args)
-        elif args.command == "test":
-            return cmd_test(manager, args)
-        else:
-            print(f"Unknown command: {args.command}")
-            return 1
-
+        manager.start(callback=status_callback)
     except KeyboardInterrupt:
-        print("\nInterrupted by user")
-        return 130
+        typer.echo("\nInterrupted by user. Shutting down.")
     except Exception as e:
-        print(f"Error: {e}")
-        return 1
+        typer.secho(f"Error during execution: {e}", fg=typer.colors.RED)
+        raise typer.Exit(1)
 
 
-def cmd_start(manager: QueueManager, args) -> int:
-    """Start the queue processor."""
-
-    def status_callback(state):
-        if args.verbose:
-            stats = state.get_stats()
-            print(f"Queue status: {stats['status_counts']}")
-
-    manager.start(callback=status_callback if args.verbose else None)
-    return 0
-
-
-def cmd_add(manager: QueueManager, args) -> int:
+@app.command()
+def add(
+    prompt: Annotated[str, typer.Argument(help="The prompt text")],
+    priority: Annotated[int, typer.Option("-p", "--priority", help="Priority (lower = higher priority).")] = 0,
+    working_dir: Annotated[str, typer.Option("-d", "--working-dir", help="Working directory.")] = ".",
+    context_files: Annotated[Optional[List[str]], typer.Option("-f", "--context-files", help="Context files to include.")] = None,
+    max_retries: Annotated[int, typer.Option("-r", "--max-retries", help="Maximum retry attempts.")] = 3,
+    estimated_tokens: Annotated[Optional[int], typer.Option("-t", "--estimated-tokens", help="Estimated token usage.")] = None,
+):
     """Add a prompt to the queue."""
-    prompt = QueuedPrompt(
-        content=args.prompt,
-        working_directory=args.working_dir,
-        priority=args.priority,
-        context_files=args.context_files,
-        max_retries=args.max_retries,
-        estimated_tokens=args.estimated_tokens,
+    manager: QueueManager = state["manager"]
+    queued_prompt = QueuedPrompt(
+        content=prompt,
+        working_directory=working_dir,
+        priority=priority,
+        context_files=context_files or [],
+        max_retries=max_retries,
+        estimated_tokens=estimated_tokens,
     )
 
-    success = manager.add_prompt(prompt)
-    return 0 if success else 1
+    if manager.add_prompt(queued_prompt):
+        typer.secho(f"Successfully added prompt {queued_prompt.id}", fg=typer.colors.GREEN)
+    else:
+        typer.secho("Failed to add prompt.", fg=typer.colors.RED)
+        raise typer.Exit(1)
 
 
-def cmd_template(manager: QueueManager, args) -> int:
+@app.command()
+def template(
+    filename: Annotated[str, typer.Argument(help="Template filename (without .md extension).")],
+    priority: Annotated[int, typer.Option("-p", "--priority", help="Default priority.")] = 0,
+):
     """Create a prompt template file."""
-    file_path = manager.create_prompt_template(args.filename, args.priority)
-    print(f"Created template: {file_path}")
-    print("Edit the file and it will be automatically picked up by the queue processor")
-    return 0
+    manager: QueueManager = state["manager"]
+    file_path = manager.create_prompt_template(filename, priority)
+    typer.echo(f"Created template: {file_path}")
+    typer.echo("Edit the file and it will be automatically picked up by the queue processor.")
 
 
-def cmd_status(manager: QueueManager, args) -> int:
+@app.command()
+def status(
+    json_output: Annotated[bool, typer.Option("--json", help="Output as JSON.")] = False,
+    detailed: Annotated[bool, typer.Option("-d", "--detailed", help="Show detailed prompt info.")] = False,
+):
     """Show queue status."""
-    state = manager.get_status()
-    stats = state.get_stats()
+    manager: QueueManager = state["manager"]
+    q_state = manager.get_status()
+    stats = q_state.get_stats()
 
-    if args.json:
-        print(json.dumps(stats, indent=2))
-        return 0
+    if json_output:
+        typer.echo(json.dumps(stats, indent=2))
+        return
 
-    print("Claude Code Queue Status")
-    print("=" * 40)
-    print(f"Total prompts: {stats['total_prompts']}")
-    print(f"Total processed: {stats['total_processed']}")
-    print(f"Failed count: {stats['failed_count']}")
-    print(f"Rate limited count: {stats['rate_limited_count']}")
+    typer.secho("Claude Code Queue Status", bold=True)
+    typer.echo("=" * 40)
+    typer.echo(f"Total prompts: {stats['total_prompts']}")
+    typer.echo(f"Total processed: {stats['total_processed']}")
+    typer.echo(f"Failed count: {stats['failed_count']}")
+    typer.echo(f"Rate limited count: {stats['rate_limited_count']}")
 
     if stats["last_processed"]:
         last_processed = datetime.fromisoformat(stats["last_processed"])
-        print(f"Last processed: {last_processed.strftime('%Y-%m-%d %H:%M:%S')}")
+        typer.echo(f"Last processed: {last_processed.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    print("\nStatus breakdown:")
-    for status, count in stats["status_counts"].items():
+    typer.secho("\nStatus breakdown:", bold=True)
+    for status_val, count in stats["status_counts"].items():
         if count > 0:
-            print(f"  {status}: {count}")
+            typer.echo(f"  {status_val}: {count}")
 
     if stats["current_rate_limit"]["is_rate_limited"]:
         reset_time = stats["current_rate_limit"]["reset_time"]
         if reset_time:
             reset_dt = datetime.fromisoformat(reset_time)
-            print(f"\nRate limited until: {reset_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            typer.secho(f"\nRate limited until: {reset_dt.strftime('%Y-%m-%d %H:%M:%S')}", fg=typer.colors.YELLOW)
 
-    if args.detailed and state.prompts:
-        print("\nPrompts:")
-        print("-" * 40)
-        for prompt in sorted(state.prompts, key=lambda p: p.priority):
-            status_icon = {
-                PromptStatus.QUEUED: "⏳",
-                PromptStatus.EXECUTING: "▶️",
-                PromptStatus.COMPLETED: "✅",
-                PromptStatus.FAILED: "❌",
-                PromptStatus.CANCELLED: "🚫",
-                PromptStatus.RATE_LIMITED: "⚠️",
-            }.get(prompt.status, "❓")
-
-            print(
-                f"{status_icon} {prompt.id} (P{prompt.priority}) - {prompt.status.value}"
-            )
-            print(
-                f"   {prompt.content[:80]}{'...' if len(prompt.content) > 80 else ''}"
-            )
+    if detailed and q_state.prompts:
+        typer.secho("\nPrompts:", bold=True)
+        typer.echo("-" * 40)
+        status_icons = {
+            PromptStatus.QUEUED: "⏳", PromptStatus.EXECUTING: "▶️", PromptStatus.COMPLETED: "✅",
+            PromptStatus.FAILED: "❌", PromptStatus.CANCELLED: "🚫", PromptStatus.RATE_LIMITED: "⚠️",
+        }
+        for prompt in sorted(q_state.prompts, key=lambda p: p.priority):
+            icon = status_icons.get(prompt.status, "❓")
+            typer.echo(f"{icon} {prompt.id} (P{prompt.priority}) - {prompt.status.value}")
+            typer.echo(f"   {prompt.content[:80]}{'...' if len(prompt.content) > 80 else ''}")
             if prompt.retry_count > 0:
-                print(f"   Retries: {prompt.retry_count}/{prompt.max_retries}")
-
-    return 0
+                typer.echo(f"   Retries: {prompt.retry_count}/{prompt.max_retries}")
 
 
-def cmd_cancel(manager: QueueManager, args) -> int:
+@app.command()
+def cancel(
+    prompt_id: Annotated[str, typer.Argument(help="Prompt ID to cancel.")]
+):
     """Cancel a prompt."""
-    success = manager.remove_prompt(args.prompt_id)
-    return 0 if success else 1
-
-
-def cmd_list(manager: QueueManager, args) -> int:
-    """List prompts."""
-    state = manager.get_status()
-    prompts = state.prompts
-
-    if args.status:
-        status_filter = PromptStatus(args.status)
-        prompts = [p for p in prompts if p.status == status_filter]
-
-    if args.json:
-        prompt_data = []
-        for prompt in prompts:
-            prompt_data.append(
-                {
-                    "id": prompt.id,
-                    "content": prompt.content,
-                    "status": prompt.status.value,
-                    "priority": prompt.priority,
-                    "working_directory": prompt.working_directory,
-                    "created_at": prompt.created_at.isoformat(),
-                    "retry_count": prompt.retry_count,
-                    "max_retries": prompt.max_retries,
-                }
-            )
-        print(json.dumps(prompt_data, indent=2))
+    manager: QueueManager = state["manager"]
+    if manager.remove_prompt(prompt_id):
+        typer.secho(f"Successfully cancelled prompt {prompt_id}", fg=typer.colors.GREEN)
     else:
-        if not prompts:
-            print("No prompts found")
-            return 0
-
-        print(f"Found {len(prompts)} prompts:")
-        print("-" * 80)
-        for prompt in sorted(prompts, key=lambda p: p.priority):
-            status_icon = {
-                PromptStatus.QUEUED: "⏳",
-                PromptStatus.EXECUTING: "▶️",
-                PromptStatus.COMPLETED: "✅",
-                PromptStatus.FAILED: "❌",
-                PromptStatus.CANCELLED: "🚫",
-                PromptStatus.RATE_LIMITED: "⚠️",
-            }.get(prompt.status, "❓")
-
-            print(
-                f"{status_icon} {prompt.id} | P{prompt.priority} | {prompt.status.value}"
-            )
-            print(
-                f"   {prompt.content[:70]}{'...' if len(prompt.content) > 70 else ''}"
-            )
-            print(f"   Created: {prompt.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
-
-    return 0
+        typer.secho(f"Could not find or cancel prompt {prompt_id}", fg=typer.colors.RED)
+        raise typer.Exit(1)
 
 
-def cmd_test(manager: QueueManager, args) -> int:
+@app.command(name="list")
+def list_prompts(
+    status: Annotated[Optional[PromptStatus], typer.Option(
+        help="Filter by status.",
+        case_sensitive=False
+    )] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Output as JSON.")] = False,
+):
+    """List prompts."""
+    manager: QueueManager = state["manager"]
+    q_state = manager.get_status()
+    prompts = q_state.prompts
+
+    if status:
+        prompts = [p for p in prompts if p.status == status]
+
+    if json_output:
+        prompt_data = [json.loads(p.model_dump_json()) for p in prompts]
+        typer.echo(json.dumps(prompt_data, indent=2))
+        return
+
+    if not prompts:
+        typer.echo("No prompts found.")
+        return
+
+    typer.echo(f"Found {len(prompts)} prompts:")
+    typer.echo("-" * 80)
+    status_icons = {
+        PromptStatus.QUEUED: "⏳", PromptStatus.EXECUTING: "▶️", PromptStatus.COMPLETED: "✅",
+        PromptStatus.FAILED: "❌", PromptStatus.CANCELLED: "🚫", PromptStatus.RATE_LIMITED: "⚠️",
+    }
+    for prompt in sorted(prompts, key=lambda p: (p.priority, p.created_at)):
+        icon = status_icons.get(prompt.status, "❓")
+        typer.echo(f"{icon} {prompt.id} | P{prompt.priority} | {prompt.status.value}")
+        typer.echo(f"   {prompt.content[:70]}{'...' if len(prompt.content) > 70 else ''}")
+        typer.echo(f"   Created: {prompt.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
+
+
+@app.command()
+def test():
     """Test Claude Code connection."""
+    manager: QueueManager = state["manager"]
     is_working, message = manager.claude_interface.test_connection()
-    print(message)
-    return 0 if is_working else 1
+    color = typer.colors.GREEN if is_working else typer.colors.RED
+    typer.secho(message, fg=color)
+    if not is_working:
+        raise typer.Exit(1)
