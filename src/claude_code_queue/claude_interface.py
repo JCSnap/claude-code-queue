@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List, Tuple
+import math
 
 from .models import ExecutionResult, RateLimitInfo, QueuedPrompt
 
@@ -183,23 +184,7 @@ class ClaudeCodeInterface:
         now = datetime.now()
 
         hour = now.hour
-        if hour < 5:
-            next_reset = now.replace(hour=5, minute=0, second=0, microsecond=0)
-        elif hour < 10:
-            next_reset = now.replace(hour=10, minute=0, second=0, microsecond=0)
-        elif hour < 15:
-            next_reset = now.replace(hour=15, minute=0, second=0, microsecond=0)
-        elif hour < 20:
-            next_reset = now.replace(hour=20, minute=0, second=0, microsecond=0)
-        else:
-            next_reset = (now + timedelta(days=1)).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
-
-        if next_reset <= now:
-            next_reset += timedelta(hours=5)
-
-        return next_reset
+        return now.replace(hour=math.floor(hour / 5 + 1) * 5, minute=0, second=0, microsecond=0)
 
     def test_connection(self) -> Tuple[bool, str]:
         """Test if Claude Code is working."""
