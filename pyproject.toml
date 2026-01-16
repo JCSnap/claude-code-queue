@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "setuptools-rust"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-code-queue"
-version = "0.1.3"
+version = "0.2.0"
 description = "Queue Claude Code prompts and execute them when token limits reset."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -17,6 +17,10 @@ dependencies = [
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[[tool.setuptools-rust.bins]]
+target = "prompt-box"
+path = "claude-prompt-box/Cargo.toml"
 
 [project.scripts]
 claude-queue = "claude_code_queue.cli:main"

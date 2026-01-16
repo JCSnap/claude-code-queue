@@ -1,0 +1,4 @@
+include README.md
+include pyproject.toml
+recursive-include claude-prompt-box *
+prune claude-prompt-box/target

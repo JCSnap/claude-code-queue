@@ -10,6 +10,7 @@ A tool to queue Claude Code prompts and automatically execute them when token li
 -   **Retry Logic**: Automatically retry failed prompts
 -   **Persistent Storage**: Queue survives system restarts
 -   **Prompt Bank**: Save and reuse templates for recurring tasks
+-   **Interactive Prompt Box**: Browse and select files interactively with fuzzy search
 -   **CLI Interface**: Simple command-line interface
 
 ## Installation
@@ -17,6 +18,8 @@ A tool to queue Claude Code prompts and automatically execute them when token li
 ```bash
 pip install claude-code-queue
 ```
+
+**Note**: The interactive prompt box is built with Rust. If installing from source (not from PyPI), you'll need the [Rust toolchain](https://rustup.rs/) installed.
 
 Or, for local development:
 
@@ -48,7 +51,12 @@ After installation, use the `claude-queue` command:
     # Edit ~/.claude-queue/queue/my-feature.md with your prompt
     ```
 
-4. **Start the queue processor:**
+4. **Launch the interactive prompt box:**
+    ```bash
+    claude-queue prompt-box
+    ```
+
+5. **Start the queue processor:**
     ```bash
     claude-queue start
     ```
@@ -204,6 +212,44 @@ claude-queue bank delete update-docs
 
 This eliminates the need to recreate the same prompt structure every time!
 
+## Interactive Prompt Box
+
+The prompt box provides an interactive terminal UI for browsing and selecting files with fuzzy search capabilities.
+
+### Launching the Prompt Box
+
+```bash
+claude-queue prompt-box
+```
+
+### Features
+
+- **Fuzzy File Search**: Type to filter files by name or path
+- **Real-time Preview**: See file contents as you navigate
+- **Keyboard Navigation**: Use arrow keys to browse files
+- **File Selection**: Select files to include in prompts
+- **Directory Traversal**: Browse through project directories
+- **Copy to Clipboard**: Copy file paths or contents
+
+### Keyboard Shortcuts
+
+**Input Mode:**
+- `↑/↓`: Navigate history
+- `←/→`: Move cursor left/right
+- `Home/End`: Move cursor to beginning/end
+- `Enter`: Submit input
+- `Tab`: Trigger file picker for @ mentions
+- `Ctrl+C`: Copy to clipboard
+- `Ctrl+Q`: Quit application
+
+**Picker Mode (file selection):**
+- `↑/↓`: Navigate through files
+- `Enter`: Select current file
+- `Esc`: Exit picker mode
+- Type to search files with fuzzy matching
+
+The prompt box is built with Rust for fast file indexing and responsive UI, making it easy to explore large codebases and select relevant files for your Claude Code prompts.
+
 ## How It Works
 
 1. **Queue Processing**: Runs prompts in priority order (lower number = higher priority)
@@ -258,6 +304,9 @@ claude-queue add "Run tests and fix any failures" --priority 1
 
 # Create template for complex prompt
 claude-queue template database-migration --priority 2
+
+# Launch interactive file browser
+claude-queue prompt-box
 
 # Save a reusable template
 claude-queue bank save update-docs --priority 1

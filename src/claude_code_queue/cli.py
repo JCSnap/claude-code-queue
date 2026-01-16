@@ -7,6 +7,9 @@ A tool to queue Claude Code prompts and automatically execute them when token li
 
 import argparse
 import json
+import os
+import subprocess
+import sys
 from datetime import datetime
 
 from .queue_manager import QueueManager
@@ -27,6 +30,9 @@ Examples:
 
   # Create a template for detailed prompt
   python -m claude_code_queue.cli template my-feature --priority 2
+
+  # Launch interactive prompt box
+  python -m claude_code_queue.cli prompt-box
 
   # Save a reusable template to bank
   python -m claude_code_queue.cli bank save update-docs --priority 1
@@ -149,6 +155,12 @@ Examples:
     bank_delete_parser = bank_subparsers.add_parser("delete", help="Delete template from bank")
     bank_delete_parser.add_argument("template_name", help="Template name to delete")
 
+    # Prompt box subcommand
+    prompt_box_parser = subparsers.add_parser(
+        "prompt-box", help="Launch the interactive prompt box CLI", add_help=False
+    )
+    prompt_box_parser.add_argument("args", nargs=argparse.REMAINDER, help="Arguments to pass to prompt-box")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -179,6 +191,8 @@ Examples:
             return cmd_test(manager, args)
         elif args.command == "bank":
             return cmd_bank(manager, args)
+        elif args.command == "prompt-box":
+            return cmd_prompt_box(args)
         else:
             print(f"Unknown command: {args.command}")
             return 1
@@ -414,6 +428,43 @@ def cmd_bank_delete(manager: QueueManager, args) -> int:
     """Delete a template from the bank."""
     success = manager.delete_bank_template(args.template_name)
     return 0 if success else 1
+
+
+def cmd_prompt_box(args) -> int:
+    """Launch the interactive prompt box CLI."""
+    try:
+        # With setuptools-rust bins, the binary gets installed to the Python environment's bin directory
+        # We need to find it using shutil.which or check common locations
+        import shutil
+        
+        binary_name = "prompt-box"
+        if sys.platform == "win32":
+            binary_name += ".exe"
+        
+        # Try to find the binary in PATH first
+        binary_path = shutil.which(binary_name)
+        
+        if not binary_path:
+            # Fallback: check in the same directory as the Python executable
+            python_bin_dir = os.path.dirname(sys.executable)
+            potential_path = os.path.join(python_bin_dir, binary_name)
+            if os.path.exists(potential_path):
+                binary_path = potential_path
+        
+        if not binary_path or not os.path.exists(binary_path):
+            print(f"Error: prompt-box binary not found. Please reinstall the package.")
+            return 1
+        
+        # Execute the Rust binary with all arguments
+        result = subprocess.run([binary_path] + args.args, stdout=sys.stdout, stderr=sys.stderr)
+        return result.returncode
+        
+    except FileNotFoundError:
+        print(f"Error: Could not execute prompt-box binary")
+        return 1
+    except Exception as e:
+        print(f"Error launching prompt-box: {e}")
+        return 1
 
 
 if __name__ == "__main__":
