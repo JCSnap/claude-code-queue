@@ -46,7 +46,7 @@ class QueuedPrompt:
 
     def can_retry(self) -> bool:
         """Check if this prompt can be retried."""
-        return self.retry_count < self.max_retries and self.status in [
+        return (self.max_retries == -1 or self.retry_count < self.max_retries) and self.status in [
             PromptStatus.FAILED,
             PromptStatus.RATE_LIMITED,
         ]
@@ -107,6 +107,7 @@ class QueueState:
     failed_count: int = 0
     rate_limited_count: int = 0
     current_rate_limit: Optional[RateLimitInfo] = None
+    global_rate_limit_until: Optional[datetime] = None
 
     def get_next_prompt(self) -> Optional[QueuedPrompt]:
         """Get the next prompt to execute (highest priority, can execute now)."""

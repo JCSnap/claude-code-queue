@@ -148,6 +148,11 @@ class QueueStorage:
                         data["last_processed"]
                     )
 
+                if data.get("global_rate_limit_until"):
+                    state.global_rate_limit_until = datetime.fromisoformat(
+                        data["global_rate_limit_until"]
+                    )
+
             except Exception as e:
                 print(f"Error loading queue state: {e}")
 
@@ -166,6 +171,10 @@ class QueueStorage:
                 "rate_limited_count": state.rate_limited_count,
                 "last_processed": (
                     state.last_processed.isoformat() if state.last_processed else None
+                ),
+                "global_rate_limit_until": (
+                    state.global_rate_limit_until.isoformat()
+                    if state.global_rate_limit_until else None
                 ),
                 "updated_at": datetime.now().isoformat(),
             }

@@ -102,6 +102,16 @@ class QueueManager:
         if previous_last_processed and (not self.state.last_processed or self.state.last_processed < previous_last_processed):
             self.state.last_processed = previous_last_processed
 
+        if self.state.global_rate_limit_until:
+            if datetime.now() < self.state.global_rate_limit_until:
+                remaining = int((self.state.global_rate_limit_until - datetime.now()).total_seconds())
+                print(f"Queue paused due to rate limit ({remaining}s remaining)")
+                if callback:
+                    callback(self.state)
+                return
+            else:
+                self.state.global_rate_limit_until = None
+
         self._check_rate_limited_prompts()
 
         next_prompt = self.state.get_next_prompt()
@@ -154,8 +164,9 @@ class QueueManager:
         """Execute a single prompt."""
         prompt.status = PromptStatus.EXECUTING
         prompt.last_executed = datetime.now()
+        max_retries_str = "unlimited" if prompt.max_retries == -1 else str(prompt.max_retries)
         prompt.add_log(
-            f"Started execution (attempt {prompt.retry_count + 1}/{prompt.max_retries})"
+            f"Started execution (attempt {prompt.retry_count + 1}/{max_retries_str})"
         )
 
         self.storage.save_queue_state(self.state)
@@ -184,6 +195,7 @@ class QueueManager:
             prompt.status = PromptStatus.RATE_LIMITED
             prompt.rate_limited_at = datetime.now()
             prompt.retry_count += 1
+            self.state.global_rate_limit_until = datetime.now() + timedelta(minutes=5)
 
             prompt.add_log(f"{execution_summary} - RATE LIMITED")
             if result.rate_limit_info and result.rate_limit_info.limit_message:
