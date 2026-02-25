@@ -123,7 +123,9 @@ class ClaudeCodeInterface:
         # Common rate limit patterns
         rate_limit_patterns = [
             ("usage limit reached", self._extract_reset_time_from_limit_message),
+            ("usage limit", self._extract_reset_time_from_limit_message),
             ("rate limit exceeded", self._estimate_reset_time),
+            ("rate limit", self._estimate_reset_time),
             ("too many requests", self._estimate_reset_time),
             ("quota exceeded", self._estimate_reset_time),
             ("limit exceeded", self._estimate_reset_time),
