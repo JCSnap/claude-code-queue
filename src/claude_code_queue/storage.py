@@ -35,6 +35,17 @@ class MarkdownPromptParser:
                 frontmatter = ""
                 markdown_content = content
 
+            # Strip execution log appended by write_prompt_file() so prompt.content
+            # only ever holds the original user-written text.
+            _LOG_SENTINEL = "\n\n<!-- claude-queue:execution-log -->\n"
+            if _LOG_SENTINEL in markdown_content:
+                markdown_content = markdown_content.split(_LOG_SENTINEL, 1)[0].rstrip()
+            else:
+                # Legacy fallback: files written before the sentinel was introduced
+                _LOG_LEGACY = "\n\n## Execution Log\n\n"
+                if _LOG_LEGACY in markdown_content:
+                    markdown_content = markdown_content.split(_LOG_LEGACY, 1)[0].rstrip()
+
             metadata: dict = {}
             if frontmatter.strip():
                 try:
@@ -96,7 +107,8 @@ class MarkdownPromptParser:
                 f.write(prompt.content)
 
                 if prompt.execution_log:
-                    f.write("\n\n## Execution Log\n\n")
+                    f.write("\n\n<!-- claude-queue:execution-log -->\n")
+                    f.write("## Execution Log\n\n")
                     f.write("```\n")
                     f.write(prompt.execution_log)
                     f.write("```\n")
