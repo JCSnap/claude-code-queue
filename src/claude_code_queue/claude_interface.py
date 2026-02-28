@@ -193,7 +193,7 @@ class ClaudeCodeInterface:
             next_reset = now.replace(hour=20, minute=0, second=0, microsecond=0)
         else:
             next_reset = (now + timedelta(days=1)).replace(
-                hour=0, minute=0, second=0, microsecond=0
+                hour=1, minute=0, second=0, microsecond=0
             )
 
         if next_reset <= now:
