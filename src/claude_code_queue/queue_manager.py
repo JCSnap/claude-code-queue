@@ -102,7 +102,13 @@ class QueueManager:
         if previous_last_processed and (not self.state.last_processed or self.state.last_processed < previous_last_processed):
             self.state.last_processed = previous_last_processed
 
+        _statuses_before = {p.id: p.status for p in self.state.prompts}
         self._check_rate_limited_prompts()
+        _rate_limit_check_changed = any(
+            self.state.get_prompt(pid) is not None
+            and self.state.get_prompt(pid).status != status
+            for pid, status in _statuses_before.items()
+        )
 
         next_prompt = self.state.get_next_prompt()
 
@@ -117,6 +123,8 @@ class QueueManager:
             else:
                 print("No prompts in queue")
 
+            if _rate_limit_check_changed:
+                self.storage.save_queue_state(self.state)
             if callback:
                 callback(self.state)
             return
@@ -130,17 +138,21 @@ class QueueManager:
             callback(self.state)
 
     def _check_rate_limited_prompts(self) -> None:
-        """Check if any rate-limited prompts should be retried (simple periodic retry)."""
+        """Check if any rate-limited prompts should be retried."""
         current_time = datetime.now()
 
         for prompt in self.state.prompts:
             if prompt.status == PromptStatus.RATE_LIMITED:
-                # Check if enough time has passed since last rate limit (5+ minutes)
-                if (
+                can_retry_now = False
+                if prompt.reset_time and current_time >= prompt.reset_time:
+                    can_retry_now = True
+                elif (
                     prompt.rate_limited_at
                     and current_time >= prompt.rate_limited_at + timedelta(minutes=5)
                 ):
+                    can_retry_now = True
 
+                if can_retry_now:
                     if prompt.can_retry():
                         prompt.status = PromptStatus.QUEUED
                         prompt.add_log(f"Retrying after rate limit cooldown")
@@ -180,10 +192,12 @@ class QueueManager:
             print(f"✓ Prompt {prompt.id} completed successfully")
 
         elif result.is_rate_limited:
-            was_already_rate_limited = prompt.status == PromptStatus.RATE_LIMITED
+            was_already_rate_limited = prompt.rate_limited_at is not None
             prompt.status = PromptStatus.RATE_LIMITED
             prompt.rate_limited_at = datetime.now()
             prompt.retry_count += 1
+            if result.rate_limit_info and result.rate_limit_info.reset_time:
+                prompt.reset_time = result.rate_limit_info.reset_time.replace(tzinfo=None)
 
             prompt.add_log(f"{execution_summary} - RATE LIMITED")
             if result.rate_limit_info and result.rate_limit_info.limit_message:

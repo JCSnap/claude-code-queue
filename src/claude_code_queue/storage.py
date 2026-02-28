@@ -13,6 +13,18 @@ import yaml  # type: ignore
 from .models import QueuedPrompt, QueueState, PromptStatus
 
 
+def _parse_optional_datetime(value) -> Optional[datetime]:
+    """Parse an ISO datetime string from YAML, returning None on any failure.
+    Strips timezone info to keep all datetimes naive (consistent with datetime.now())."""
+    if value is None:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))
+        return dt.replace(tzinfo=None)
+    except (ValueError, TypeError):
+        return None
+
+
 class MarkdownPromptParser:
     """Parser for markdown-based prompt files."""
 
@@ -48,6 +60,11 @@ class MarkdownPromptParser:
                 else file_path.stem
             )
 
+            try:
+                retry_count = int(metadata.get("retry_count", 0))
+            except (ValueError, TypeError):
+                retry_count = 0
+
             prompt = QueuedPrompt(
                 id=prompt_id,
                 content=markdown_content,
@@ -57,6 +74,10 @@ class MarkdownPromptParser:
                 max_retries=metadata.get("max_retries", 3),
                 estimated_tokens=metadata.get("estimated_tokens"),
                 created_at=datetime.fromtimestamp(file_path.stat().st_ctime),
+                retry_count=retry_count,
+                rate_limited_at=_parse_optional_datetime(metadata.get("rate_limited_at")),
+                reset_time=_parse_optional_datetime(metadata.get("reset_time")),
+                last_executed=_parse_optional_datetime(metadata.get("last_executed")),
             )
 
             return prompt
