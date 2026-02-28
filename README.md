@@ -7,7 +7,7 @@ A tool to queue Claude Code prompts and automatically execute them when token li
 -   **Markdown-based Queue**: Each prompt is a `.md` file with YAML frontmatter
 -   **Automatic Rate Limit Handling**: Detects rate limits and waits for reset windows
 -   **Priority System**: Execute high-priority prompts first
--   **Retry Logic**: Automatically retry failed prompts
+-   **Retry Logic**: Automatically retry failed and rate-limited prompts; both share the `max_retries` total-attempts counter
 -   **Persistent Storage**: Queue survives system restarts
 -   **Prompt Bank**: Save and reuse templates for recurring tasks
 -   **Interactive Prompt Box**: Browse and select files interactively with fuzzy search
