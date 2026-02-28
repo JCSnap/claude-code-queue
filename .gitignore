@@ -1,3 +1,5 @@
 dist/
 src/claude_code_queue.egg-info/
 dev.md
+__pycache__/
+*.pyc
