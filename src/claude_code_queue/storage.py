@@ -187,7 +187,8 @@ class QueueStorage:
         for file_path in self.queue_dir.glob("*.executing.md"):
             prompt = self.parser.parse_prompt_file(file_path)
             if prompt:
-                prompt.status = PromptStatus.EXECUTING
+                prompt.status = PromptStatus.QUEUED
+                prompt.add_log("Recovered: execution was interrupted. Re-queuing.")
                 prompts.append(prompt)
                 processed_ids.add(prompt.id)
 
@@ -242,6 +243,7 @@ class QueueStorage:
                 self._remove_prompt_files(prompt.id, self.queue_dir)
             else:  # QUEUED
                 target_dir = self.queue_dir
+                self._remove_prompt_files(prompt.id, self.queue_dir)
             file_path = target_dir / base_filename
             return self.parser.write_prompt_file(prompt, file_path)
         except Exception as e:
