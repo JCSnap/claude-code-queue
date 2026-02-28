@@ -117,6 +117,11 @@ class QueueManager:
             else:
                 print("No prompts in queue")
 
+            # Fix S8: _check_rate_limited_prompts() may have transitioned prompts to
+            # FAILED. Save state so those transitions are persisted even when no prompt
+            # is executed this iteration.
+            self.storage.save_queue_state(self.state)
+
             if callback:
                 callback(self.state)
             return
@@ -130,32 +135,41 @@ class QueueManager:
             callback(self.state)
 
     def _check_rate_limited_prompts(self) -> None:
-        """Check if any rate-limited prompts should be retried (simple periodic retry)."""
+        """Check if any rate-limited prompts should be retried."""
         current_time = datetime.now()
 
         for prompt in self.state.prompts:
-            if prompt.status == PromptStatus.RATE_LIMITED:
-                # Check if enough time has passed since last rate limit (5+ minutes)
-                if (
-                    prompt.rate_limited_at
-                    and current_time >= prompt.rate_limited_at + timedelta(minutes=5)
-                ):
+            if prompt.status != PromptStatus.RATE_LIMITED:
+                continue
 
-                    if prompt.can_retry():
-                        prompt.status = PromptStatus.QUEUED
-                        prompt.add_log(f"Retrying after rate limit cooldown")
-                        print(f"✓ Prompt {prompt.id} ready for retry after cooldown")
-                    else:
-                        prompt.status = PromptStatus.FAILED
-                        prompt.add_log(f"Max retries ({prompt.max_retries}) exceeded")
-                        print(f"✗ Prompt {prompt.id} failed - max retries exceeded")
+            # Fix 4c: use reset_time as the authoritative gate when available.
+            # The 5-minute heuristic is a fallback for when no reset_time was parsed.
+            if prompt.reset_time is not None:
+                if current_time < prompt.reset_time:
+                    continue  # reset window not yet reached — stay RATE_LIMITED
+                # reset_time has passed → fall through to retry/fail logic
+            elif not (
+                prompt.rate_limited_at
+                and current_time >= prompt.rate_limited_at + timedelta(minutes=5)
+            ):
+                continue  # heuristic window not yet elapsed — stay RATE_LIMITED
+
+            if prompt.can_retry():
+                prompt.status = PromptStatus.QUEUED
+                prompt.add_log("Retrying after rate limit cooldown")
+                print(f"✓ Prompt {prompt.id} ready for retry after cooldown")
+            else:
+                prompt.status = PromptStatus.FAILED
+                prompt.add_log(f"Max retries ({prompt.max_retries}) exceeded")
+                print(f"✗ Prompt {prompt.id} failed - max retries exceeded")
 
     def _execute_prompt(self, prompt: QueuedPrompt) -> None:
         """Execute a single prompt."""
         prompt.status = PromptStatus.EXECUTING
         prompt.last_executed = datetime.now()
+        retries_str = "∞" if prompt.max_retries == -1 else str(prompt.max_retries)
         prompt.add_log(
-            f"Started execution (attempt {prompt.retry_count + 1}/{prompt.max_retries})"
+            f"Started execution (attempt {prompt.retry_count + 1}/{retries_str})"
         )
 
         self.storage.save_queue_state(self.state)
@@ -180,10 +194,22 @@ class QueueManager:
             print(f"✓ Prompt {prompt.id} completed successfully")
 
         elif result.is_rate_limited:
-            was_already_rate_limited = prompt.status == PromptStatus.RATE_LIMITED
+            # Fix S4: prompt.status is EXECUTING at this point — checking it against
+            # RATE_LIMITED always returns False. Use rate_limited_at (persisted from
+            # the previous rate-limit event) as the authoritative signal instead.
+            was_already_rate_limited = prompt.rate_limited_at is not None
             prompt.status = PromptStatus.RATE_LIMITED
             prompt.rate_limited_at = datetime.now()
             prompt.retry_count += 1
+            # Fix S1: propagate the parsed reset_time onto the prompt so it survives
+            # the next file reload and _check_rate_limited_prompts() can use it.
+            # .replace(tzinfo=None) guards same-session comparisons against tz-aware
+            # datetimes constructed directly (e.g. in tests); _cap_reset_time() already
+            # strips tzinfo in the normal production path via _detect_rate_limit().
+            if result.rate_limit_info and result.rate_limit_info.reset_time is not None:
+                prompt.reset_time = result.rate_limit_info.reset_time.replace(tzinfo=None)
+            else:
+                prompt.reset_time = None  # clear any stale value; fall back to heuristic
 
             prompt.add_log(f"{execution_summary} - RATE LIMITED")
             if result.rate_limit_info and result.rate_limit_info.limit_message:
