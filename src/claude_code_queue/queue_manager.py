@@ -154,8 +154,9 @@ class QueueManager:
         """Execute a single prompt."""
         prompt.status = PromptStatus.EXECUTING
         prompt.last_executed = datetime.now()
+        max_label = "∞" if prompt.max_retries == -1 else str(prompt.max_retries)
         prompt.add_log(
-            f"Started execution (attempt {prompt.retry_count + 1}/{prompt.max_retries})"
+            f"Started execution (attempt {prompt.retry_count + 1}/{max_label})"
         )
 
         self.storage.save_queue_state(self.state)
