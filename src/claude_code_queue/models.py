@@ -46,10 +46,9 @@ class QueuedPrompt:
 
     def can_retry(self) -> bool:
         """Check if this prompt can be retried."""
-        return self.retry_count < self.max_retries and self.status in [
-            PromptStatus.FAILED,
-            PromptStatus.RATE_LIMITED,
-        ]
+        if self.max_retries == -1:
+            return True
+        return self.retry_count < self.max_retries
 
     def should_execute_now(self) -> bool:
         """Check if this prompt should be executed now (not rate limited)."""
