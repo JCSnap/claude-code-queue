@@ -21,9 +21,11 @@ class QueueManager:
         claude_command: str = "claude",
         check_interval: int = 30,
         timeout: int = 3600,
+        skip_permissions: bool = True,
     ):
         self.storage = QueueStorage(storage_dir)
-        self.claude_interface = ClaudeCodeInterface(claude_command, timeout)
+        self.claude_interface = ClaudeCodeInterface(claude_command, timeout,
+                                                    skip_permissions=skip_permissions)
         self.check_interval = check_interval
         self.running = False
         self.state: Optional[QueueState] = None
