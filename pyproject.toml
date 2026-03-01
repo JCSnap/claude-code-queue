@@ -24,12 +24,6 @@ package-dir = {"" = "src"}
 [tool.setuptools.package-data]
 claude_code_queue = ["py.typed"]
 
-[[tool.setuptools-rust.bins]]
-target = "prompt-box"
-path = "claude-prompt-box/Cargo.toml"
-
-[project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-mock>=3.0"]
 
 [project.scripts]
 claude-queue = "claude_code_queue.cli:main"
