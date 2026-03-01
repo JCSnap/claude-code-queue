@@ -18,9 +18,5 @@ dependencies = [
 [tool.setuptools]
 package-dir = {"" = "src"}
 
-[[tool.setuptools-rust.bins]]
-target = "prompt-box"
-path = "claude-prompt-box/Cargo.toml"
-
 [project.scripts]
 claude-queue = "claude_code_queue.cli:main"
