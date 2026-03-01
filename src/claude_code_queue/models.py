@@ -45,11 +45,17 @@ class QueuedPrompt:
         self.execution_log += f"[{timestamp}] {message}\n"
 
     def can_retry(self) -> bool:
-        """Check if this prompt can be retried."""
-        return self.retry_count < self.max_retries and self.status in [
-            PromptStatus.FAILED,
-            PromptStatus.RATE_LIMITED,
-        ]
+        # Called by _process_execution_result() while status is still EXECUTING.
+        # The old status allowlist (FAILED, RATE_LIMITED) always returned False during
+        # execution — that was the C1 bug. A plain retry_count < max_retries
+        # replacement would make COMPLETED/CANCELLED prompts report can_retry() is True.
+        # The terminal blocklist prevents both failure modes and must not be reverted
+        # to a naive counter check.
+        terminal = (PromptStatus.COMPLETED, PromptStatus.CANCELLED)
+        if self.status in terminal:
+            return False
+        has_retries = self.max_retries == -1 or self.retry_count < self.max_retries
+        return has_retries
 
     def should_execute_now(self) -> bool:
         """Check if this prompt should be executed now (not rate limited)."""

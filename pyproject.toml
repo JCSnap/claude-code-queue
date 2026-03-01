@@ -22,5 +22,8 @@ package-dir = {"" = "src"}
 target = "prompt-box"
 path = "claude-prompt-box/Cargo.toml"
 
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-mock>=3.0"]
+
 [project.scripts]
 claude-queue = "claude_code_queue.cli:main"
