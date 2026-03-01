@@ -516,7 +516,13 @@ def cmd_prompt_box(args) -> int:
                 binary_path = potential_path
 
         if not binary_path or not os.path.exists(binary_path):
-            print(f"Error: prompt-box binary not found. Please reinstall the package.")
+            print(
+                "Error: prompt-box binary not found.\n"
+                "This feature requires the Rust toolchain to be present at install time.\n"
+                "To enable it:\n"
+                "  1. Install Rust: https://rustup.rs\n"
+                "  2. Reinstall: pip install --force-reinstall claude-code-queue"
+            )
             return 1
 
         # Execute the Rust binary with all arguments
