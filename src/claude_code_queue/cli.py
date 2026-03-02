@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 from datetime import datetime
+from pathlib import Path
 
 from .batch import (
     extract_variables,
@@ -701,8 +702,6 @@ def cmd_batch_variables(args) -> int:
 
 def cmd_install_skill(args) -> int:
     """Install the Claude Code skill file to ~/.claude/skills/queue/SKILL.md."""
-    from pathlib import Path
-
     dest = Path.home() / ".claude" / "skills" / "queue" / "SKILL.md"
     skill_src = Path(__file__).parent / "skills" / "queue" / "SKILL.md"
 

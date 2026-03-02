@@ -3,6 +3,15 @@ Shared fixtures for claude-code-queue test suite.
 """
 
 import pytest
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "llm_eval: marks tests that call the Anthropic API (requires ANTHROPIC_API_KEY)",
+    )
+
+
 from claude_code_queue.models import QueuedPrompt, QueueState, PromptStatus
 from claude_code_queue.storage import QueueStorage
 from claude_code_queue.claude_interface import ClaudeCodeInterface
