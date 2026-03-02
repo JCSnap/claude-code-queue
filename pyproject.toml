@@ -22,7 +22,7 @@ dev = ["pytest>=7.0", "pytest-mock>=3.0"]
 package-dir = {"" = "src"}
 
 [tool.setuptools.package-data]
-claude_code_queue = ["py.typed"]
+claude_code_queue = ["py.typed", "skills/**/*"]
 
 [project.scripts]
 claude-queue = "claude_code_queue.cli:main"
