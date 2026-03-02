@@ -29,6 +29,20 @@ run `pip install --force-reinstall claude-code-queue`.
 (`libxcb-dev` on Debian/Ubuntu, `libxcb-devel` on Fedora/RHEL, `libxcb` on Arch).
 At runtime, clipboard support requires `xclip` or `xsel` to be installed.
 
+### Claude Code Skill (optional)
+
+If you use [Claude Code](https://claude.ai/code), install the bundled `/queue`
+skill so Claude can help you construct and manage queue tasks:
+
+```bash
+claude-queue install-skill
+```
+
+This copies a `SKILL.md` to `~/.claude/skills/queue/`. After restarting Claude
+Code, type `/queue` to invoke it directly, and Claude will also proactively
+suggest queuing when a task is complex or likely to hit rate limits. Use
+`--force` to update an existing installation after upgrading the package.
+
 Or, for local development:
 
 ```bash
