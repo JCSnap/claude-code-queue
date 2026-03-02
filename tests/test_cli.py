@@ -5,8 +5,10 @@ Covers: argument parsing, global option forwarding, command dispatch,
 output format (text and JSON), bank sub-commands, prompt-box passthrough,
 and exit codes for every command.
 
-All tests mock ``QueueManager`` to avoid real storage / subprocess calls.
-Commands are exercised by patching ``sys.argv`` and calling ``main()``.
+Commands that use QueueManager (start, test) mock ``QueueManager``.
+All other commands mock ``QueueStorage`` directly, matching the E3 refactor
+in commit 38cbd3c which removed the QueueManager dependency from non-daemon
+subcommands.
 """
 
 import json
@@ -146,91 +148,91 @@ class TestGlobalOptions:
 class TestAddCommand:
     def _run_add(self, *extra_args, success=True):
         with patch("sys.argv", ["claude-queue", "add", "hello world"] + list(extra_args)):
-            with patch("claude_code_queue.cli.QueueManager") as mock_cls:
-                mgr = MagicMock()
-                mgr.add_prompt.return_value = success
-                mock_cls.return_value = mgr
+            with patch("claude_code_queue.cli.QueueStorage") as mock_cls:
+                storage = MagicMock()
+                storage._save_single_prompt.return_value = success
+                mock_cls.return_value = storage
                 code = main()
-                return code, mgr
+                return code, storage
 
     def test_add_prompt_content(self):
-        _, mgr = self._run_add()
-        prompt = mgr.add_prompt.call_args[0][0]
+        _, storage = self._run_add()
+        prompt = storage._save_single_prompt.call_args[0][0]
         assert prompt.content == "hello world"
 
     def test_add_default_priority_zero(self):
-        _, mgr = self._run_add()
-        prompt = mgr.add_prompt.call_args[0][0]
+        _, storage = self._run_add()
+        prompt = storage._save_single_prompt.call_args[0][0]
         assert prompt.priority == 0
 
     def test_add_long_priority_flag(self):
-        _, mgr = self._run_add("--priority", "5")
-        prompt = mgr.add_prompt.call_args[0][0]
+        _, storage = self._run_add("--priority", "5")
+        prompt = storage._save_single_prompt.call_args[0][0]
         assert prompt.priority == 5
 
     def test_add_short_priority_flag(self):
-        _, mgr = self._run_add("-p", "3")
-        prompt = mgr.add_prompt.call_args[0][0]
+        _, storage = self._run_add("-p", "3")
+        prompt = storage._save_single_prompt.call_args[0][0]
         assert prompt.priority == 3
 
     def test_add_default_working_dir_dot(self):
-        _, mgr = self._run_add()
-        prompt = mgr.add_prompt.call_args[0][0]
+        _, storage = self._run_add()
+        prompt = storage._save_single_prompt.call_args[0][0]
         assert prompt.working_directory == "."
 
     def test_add_long_working_dir_flag(self):
-        _, mgr = self._run_add("--working-dir", "/some/path")
-        prompt = mgr.add_prompt.call_args[0][0]
+        _, storage = self._run_add("--working-dir", "/some/path")
+        prompt = storage._save_single_prompt.call_args[0][0]
         assert prompt.working_directory == "/some/path"
 
     def test_add_short_working_dir_flag(self):
-        _, mgr = self._run_add("-d", "/some/path")
-        prompt = mgr.add_prompt.call_args[0][0]
+        _, storage = self._run_add("-d", "/some/path")
+        prompt = storage._save_single_prompt.call_args[0][0]
         assert prompt.working_directory == "/some/path"
 
     def test_add_context_files_long_flag(self):
-        _, mgr = self._run_add("--context-files", "a.py", "b.py")
-        prompt = mgr.add_prompt.call_args[0][0]
+        _, storage = self._run_add("--context-files", "a.py", "b.py")
+        prompt = storage._save_single_prompt.call_args[0][0]
         assert prompt.context_files == ["a.py", "b.py"]
 
     def test_add_context_files_short_flag(self):
-        _, mgr = self._run_add("-f", "a.py")
-        prompt = mgr.add_prompt.call_args[0][0]
+        _, storage = self._run_add("-f", "a.py")
+        prompt = storage._save_single_prompt.call_args[0][0]
         assert prompt.context_files == ["a.py"]
 
     def test_add_default_context_files_empty(self):
-        _, mgr = self._run_add()
-        prompt = mgr.add_prompt.call_args[0][0]
+        _, storage = self._run_add()
+        prompt = storage._save_single_prompt.call_args[0][0]
         assert prompt.context_files == []
 
     def test_add_max_retries_long_flag(self):
-        _, mgr = self._run_add("--max-retries", "5")
-        prompt = mgr.add_prompt.call_args[0][0]
+        _, storage = self._run_add("--max-retries", "5")
+        prompt = storage._save_single_prompt.call_args[0][0]
         assert prompt.max_retries == 5
 
     def test_add_max_retries_short_flag(self):
-        _, mgr = self._run_add("-r", "2")
-        prompt = mgr.add_prompt.call_args[0][0]
+        _, storage = self._run_add("-r", "2")
+        prompt = storage._save_single_prompt.call_args[0][0]
         assert prompt.max_retries == 2
 
     def test_add_default_max_retries_three(self):
-        _, mgr = self._run_add()
-        prompt = mgr.add_prompt.call_args[0][0]
+        _, storage = self._run_add()
+        prompt = storage._save_single_prompt.call_args[0][0]
         assert prompt.max_retries == 3
 
     def test_add_estimated_tokens_long_flag(self):
-        _, mgr = self._run_add("--estimated-tokens", "1500")
-        prompt = mgr.add_prompt.call_args[0][0]
+        _, storage = self._run_add("--estimated-tokens", "1500")
+        prompt = storage._save_single_prompt.call_args[0][0]
         assert prompt.estimated_tokens == 1500
 
     def test_add_estimated_tokens_short_flag(self):
-        _, mgr = self._run_add("-t", "1000")
-        prompt = mgr.add_prompt.call_args[0][0]
+        _, storage = self._run_add("-t", "1000")
+        prompt = storage._save_single_prompt.call_args[0][0]
         assert prompt.estimated_tokens == 1000
 
     def test_add_default_estimated_tokens_none(self):
-        _, mgr = self._run_add()
-        prompt = mgr.add_prompt.call_args[0][0]
+        _, storage = self._run_add()
+        prompt = storage._save_single_prompt.call_args[0][0]
         assert prompt.estimated_tokens is None
 
     def test_add_returns_zero_on_success(self):
@@ -249,30 +251,30 @@ class TestAddCommand:
 class TestTemplateCommand:
     def _run_template(self, *extra_args, path="/some/path/my-template.md"):
         with patch("sys.argv", ["claude-queue", "template", "my-template"] + list(extra_args)):
-            with patch("claude_code_queue.cli.QueueManager") as mock_cls:
-                mgr = MagicMock()
-                mgr.create_prompt_template.return_value = path
-                mock_cls.return_value = mgr
+            with patch("claude_code_queue.cli.QueueStorage") as mock_cls:
+                storage = MagicMock()
+                storage.create_prompt_template.return_value = path
+                mock_cls.return_value = storage
                 code = main()
-                return code, mgr
+                return code, storage
 
     def test_template_calls_create_with_filename(self):
-        _, mgr = self._run_template()
-        mgr.create_prompt_template.assert_called_once_with("my-template", 0)
+        _, storage = self._run_template()
+        storage.create_prompt_template.assert_called_once_with("my-template", 0)
 
     def test_template_default_priority_zero(self):
-        _, mgr = self._run_template()
-        _, priority = mgr.create_prompt_template.call_args[0]
+        _, storage = self._run_template()
+        _, priority = storage.create_prompt_template.call_args[0]
         assert priority == 0
 
     def test_template_long_priority_flag(self):
-        _, mgr = self._run_template("--priority", "2")
-        _, priority = mgr.create_prompt_template.call_args[0]
+        _, storage = self._run_template("--priority", "2")
+        _, priority = storage.create_prompt_template.call_args[0]
         assert priority == 2
 
     def test_template_short_priority_flag(self):
-        _, mgr = self._run_template("-p", "1")
-        _, priority = mgr.create_prompt_template.call_args[0]
+        _, storage = self._run_template("-p", "1")
+        _, priority = storage.create_prompt_template.call_args[0]
         assert priority == 1
 
     def test_template_prints_created_path(self, capsys):
@@ -299,10 +301,10 @@ class TestStatusCommand:
         if state is None:
             state = _make_state()
         with patch("sys.argv", ["claude-queue", "status"] + list(extra_args)):
-            with patch("claude_code_queue.cli.QueueManager") as mock_cls:
-                mgr = MagicMock()
-                mgr.get_status.return_value = state
-                mock_cls.return_value = mgr
+            with patch("claude_code_queue.cli.QueueStorage") as mock_cls:
+                storage = MagicMock()
+                storage.load_queue_state.return_value = state
+                mock_cls.return_value = storage
                 code = main()
                 return code
 
@@ -396,25 +398,34 @@ class TestStatusCommand:
 # ===========================================================================
 
 class TestCancelCommand:
-    def _run_cancel(self, prompt_id, success=True):
+    def _run_cancel(self, prompt_id, found=True, save_success=True):
+        prompts = (
+            [QueuedPrompt(id=prompt_id, content="test", status=PromptStatus.QUEUED)]
+            if found
+            else []
+        )
+        state = _make_state(prompts=prompts)
         with patch("sys.argv", ["claude-queue", "cancel", prompt_id]):
-            with patch("claude_code_queue.cli.QueueManager") as mock_cls:
-                mgr = MagicMock()
-                mgr.remove_prompt.return_value = success
-                mock_cls.return_value = mgr
+            with patch("claude_code_queue.cli.QueueStorage") as mock_cls:
+                storage = MagicMock()
+                storage.load_queue_state.return_value = state
+                storage._save_single_prompt.return_value = save_success
+                mock_cls.return_value = storage
                 code = main()
-                return code, mgr
+                return code, storage
 
     def test_cancel_calls_remove_prompt_with_id(self):
-        _, mgr = self._run_cancel("abc123")
-        mgr.remove_prompt.assert_called_once_with("abc123")
+        _, storage = self._run_cancel("abc123")
+        prompt = storage._save_single_prompt.call_args[0][0]
+        assert prompt.id == "abc123"
+        assert prompt.status == PromptStatus.CANCELLED
 
     def test_cancel_returns_zero_on_success(self):
-        code, _ = self._run_cancel("abc123", success=True)
+        code, _ = self._run_cancel("abc123", found=True, save_success=True)
         assert code == 0
 
     def test_cancel_returns_one_on_failure(self):
-        code, _ = self._run_cancel("abc123", success=False)
+        code, _ = self._run_cancel("abc123", found=False)
         assert code == 1
 
 
@@ -436,10 +447,10 @@ class TestListCommand:
         p = prompts if prompts is not None else self._ALL_PROMPTS
         state = _make_state(prompts=p)
         with patch("sys.argv", ["claude-queue", "list"] + list(extra_args)):
-            with patch("claude_code_queue.cli.QueueManager") as mock_cls:
-                mgr = MagicMock()
-                mgr.get_status.return_value = state
-                mock_cls.return_value = mgr
+            with patch("claude_code_queue.cli.QueueStorage") as mock_cls:
+                storage = MagicMock()
+                storage.load_queue_state.return_value = state
+                mock_cls.return_value = storage
                 code = main()
                 return code
 
@@ -576,30 +587,30 @@ class TestBankSaveCommand:
 
     def _run_bank_save(self, *extra_args):
         with patch("sys.argv", ["claude-queue", "bank", "save", "my-template"] + list(extra_args)):
-            with patch("claude_code_queue.cli.QueueManager") as mock_cls:
-                mgr = MagicMock()
-                mgr.save_prompt_to_bank.return_value = self._BANK_PATH
-                mock_cls.return_value = mgr
+            with patch("claude_code_queue.cli.QueueStorage") as mock_cls:
+                storage = MagicMock()
+                storage.save_prompt_to_bank.return_value = self._BANK_PATH
+                mock_cls.return_value = storage
                 code = main()
-                return code, mgr
+                return code, storage
 
     def test_bank_save_calls_save_prompt_to_bank(self):
-        _, mgr = self._run_bank_save()
-        mgr.save_prompt_to_bank.assert_called_once_with("my-template", 0)
+        _, storage = self._run_bank_save()
+        storage.save_prompt_to_bank.assert_called_once_with("my-template", 0)
 
     def test_bank_save_default_priority_zero(self):
-        _, mgr = self._run_bank_save()
-        _, priority = mgr.save_prompt_to_bank.call_args[0]
+        _, storage = self._run_bank_save()
+        _, priority = storage.save_prompt_to_bank.call_args[0]
         assert priority == 0
 
     def test_bank_save_long_priority_flag(self):
-        _, mgr = self._run_bank_save("--priority", "3")
-        _, priority = mgr.save_prompt_to_bank.call_args[0]
+        _, storage = self._run_bank_save("--priority", "3")
+        _, priority = storage.save_prompt_to_bank.call_args[0]
         assert priority == 3
 
     def test_bank_save_short_priority_flag(self):
-        _, mgr = self._run_bank_save("-p", "2")
-        _, priority = mgr.save_prompt_to_bank.call_args[0]
+        _, storage = self._run_bank_save("-p", "2")
+        _, priority = storage.save_prompt_to_bank.call_args[0]
         assert priority == 2
 
     def test_bank_save_prints_path(self, capsys):
@@ -624,10 +635,10 @@ class TestBankListCommand:
         if templates is None:
             templates = [_make_template()]
         with patch("sys.argv", ["claude-queue", "bank", "list"] + list(extra_args)):
-            with patch("claude_code_queue.cli.QueueManager") as mock_cls:
-                mgr = MagicMock()
-                mgr.list_bank_templates.return_value = templates
-                mock_cls.return_value = mgr
+            with patch("claude_code_queue.cli.QueueStorage") as mock_cls:
+                storage = MagicMock()
+                storage.list_bank_templates.return_value = templates
+                mock_cls.return_value = storage
                 code = main()
                 return code
 
@@ -701,15 +712,19 @@ class TestBankListCommand:
 class TestBankUseCommand:
     def _run_bank_use(self, success=True):
         with patch("sys.argv", ["claude-queue", "bank", "use", "my-template"]):
-            with patch("claude_code_queue.cli.QueueManager") as mock_cls:
-                mgr = MagicMock()
-                mgr.use_bank_template.return_value = success
-                mock_cls.return_value = mgr
-                return main(), mgr
+            with patch("claude_code_queue.cli.QueueStorage") as mock_cls:
+                storage = MagicMock()
+                if success:
+                    storage.use_bank_template.return_value = QueuedPrompt(content="test")
+                    storage._save_single_prompt.return_value = True
+                else:
+                    storage.use_bank_template.return_value = None
+                mock_cls.return_value = storage
+                return main(), storage
 
     def test_bank_use_calls_use_bank_template(self):
-        _, mgr = self._run_bank_use()
-        mgr.use_bank_template.assert_called_once_with("my-template")
+        _, storage = self._run_bank_use()
+        storage.use_bank_template.assert_called_once_with("my-template")
 
     def test_bank_use_returns_zero_on_success(self):
         code, _ = self._run_bank_use(success=True)
@@ -727,15 +742,15 @@ class TestBankUseCommand:
 class TestBankDeleteCommand:
     def _run_bank_delete(self, success=True):
         with patch("sys.argv", ["claude-queue", "bank", "delete", "my-template"]):
-            with patch("claude_code_queue.cli.QueueManager") as mock_cls:
-                mgr = MagicMock()
-                mgr.delete_bank_template.return_value = success
-                mock_cls.return_value = mgr
-                return main(), mgr
+            with patch("claude_code_queue.cli.QueueStorage") as mock_cls:
+                storage = MagicMock()
+                storage.delete_bank_template.return_value = success
+                mock_cls.return_value = storage
+                return main(), storage
 
     def test_bank_delete_calls_delete_bank_template(self):
-        _, mgr = self._run_bank_delete()
-        mgr.delete_bank_template.assert_called_once_with("my-template")
+        _, storage = self._run_bank_delete()
+        storage.delete_bank_template.assert_called_once_with("my-template")
 
     def test_bank_delete_returns_zero_on_success(self):
         code, _ = self._run_bank_delete(success=True)
