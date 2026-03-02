@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-mock"]
+eval = ["pytest", "pytest-mock", "anthropic>=0.40.0"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
