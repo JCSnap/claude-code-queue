@@ -323,7 +323,6 @@ class QueueStorage:
             if (
                 file_path.name.endswith(".executing.md")
                 or file_path.name.endswith(".rate-limited.md")
-                or "#" in file_path.name
             ):
                 continue
 
@@ -402,7 +401,7 @@ class QueueStorage:
     @staticmethod
     def _sanitize_filename_static(text: str) -> str:
         """Sanitize text for use in filename (static version for use in parser)."""
-        invalid_chars = '<>:"/\\|?*'
+        invalid_chars = '<>:"/\\|?*#'
         for char in invalid_chars:
             text = text.replace(char, "-")
 
