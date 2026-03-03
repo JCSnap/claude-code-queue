@@ -401,7 +401,7 @@ class QueueStorage:
     @staticmethod
     def _sanitize_filename_static(text: str) -> str:
         """Sanitize text for use in filename (static version for use in parser)."""
-        invalid_chars = '<>:"/\\|?*#'
+        invalid_chars = '<>:"/\\|?*#\'`'
         for char in invalid_chars:
             text = text.replace(char, "-")
 
