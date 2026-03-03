@@ -433,13 +433,15 @@ def test_write_then_parse_roundtrip_preserves_priority(tmp_path):  # STO-026
 def test_get_base_filename_sanitizes_special_chars():  # STO-027
     """Special characters in content are removed from the generated filename."""
     prompt = QueuedPrompt(
-        id="abc12345", content="Fix <auth> module: add/remove tokens?"
+        id="abc12345", content="Fix <auth> module: add/remove tokens? it's `done`"
     )
     filename = MarkdownPromptParser.get_base_filename(prompt)
     assert "/" not in filename
     assert "<" not in filename
     assert ">" not in filename
     assert "?" not in filename
+    assert "'" not in filename
+    assert "`" not in filename
     assert filename.startswith("abc12345-")
 
 
