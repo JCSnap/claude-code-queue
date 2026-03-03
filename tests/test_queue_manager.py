@@ -44,6 +44,16 @@ def _rate_limit_result(reset_time=None) -> ExecutionResult:
     )
 
 
+def _non_retryable_result(error: str = "Error: Claude Code cannot be launched inside another Claude Code session.") -> ExecutionResult:
+    return ExecutionResult(
+        success=False,
+        output="",
+        error=error,
+        execution_time=0.4,
+        is_non_retryable=True,
+    )
+
+
 # ===========================================================================
 # Rate-Limit Result Processing
 # ===========================================================================
@@ -490,3 +500,71 @@ def test_manager_add_prompt_saves_to_disk(manager):  # QMG-024
     assert p.id in ids, (
         f"Prompt {p.id!r} not found in reloaded state. Found ids: {ids}"
     )
+
+
+# ===========================================================================
+# Non-Retryable Error Handling
+# ===========================================================================
+
+
+def test_non_retryable_error_immediately_fails_with_unlimited_retries(manager, mocker):  # QMG-NR-001
+    """A non-retryable error marks the prompt FAILED immediately even when max_retries=-1."""
+    prompt = QueuedPrompt(id="test01", content="task", max_retries=-1)
+    manager.state = manager.storage.load_queue_state()
+    manager.state.add_prompt(prompt)
+
+    mocker.patch.object(
+        manager.claude_interface, "execute_prompt", return_value=_non_retryable_result()
+    )
+    manager._execute_prompt(prompt)
+
+    assert prompt.status == PromptStatus.FAILED
+    assert prompt.retry_count == 0  # retry_count not incremented for non-retryable errors
+    assert manager.state.failed_count == 1
+
+
+def test_non_retryable_error_immediately_fails_with_finite_retries(manager, mocker):  # QMG-NR-002
+    """A non-retryable error fails the prompt immediately even when retries remain."""
+    prompt = QueuedPrompt(id="test02", content="task", max_retries=3)
+    manager.state = manager.storage.load_queue_state()
+    manager.state.add_prompt(prompt)
+
+    mocker.patch.object(
+        manager.claude_interface, "execute_prompt", return_value=_non_retryable_result()
+    )
+    manager._execute_prompt(prompt)
+
+    assert prompt.status == PromptStatus.FAILED
+    # retry_count not consumed: if re-queued manually, full budget is available
+    assert prompt.retry_count == 0
+    assert manager.state.failed_count == 1
+
+
+def test_non_retryable_error_logged_as_non_retryable(manager, mocker):  # QMG-NR-003
+    """Execution log mentions non-retryable so operator knows why no retry occurred."""
+    prompt = QueuedPrompt(id="test03", content="task", max_retries=-1)
+    manager.state = manager.storage.load_queue_state()
+    manager.state.add_prompt(prompt)
+
+    mocker.patch.object(
+        manager.claude_interface, "execute_prompt", return_value=_non_retryable_result()
+    )
+    manager._execute_prompt(prompt)
+
+    assert "non-retryable" in prompt.execution_log.lower()
+
+
+def test_ordinary_failure_still_retries(manager, mocker):  # QMG-NR-004
+    """A normal (retryable) failure still uses the can_retry() path."""
+    prompt = QueuedPrompt(id="test04", content="task", max_retries=3)
+    manager.state = manager.storage.load_queue_state()
+    manager.state.add_prompt(prompt)
+
+    mocker.patch.object(
+        manager.claude_interface, "execute_prompt",
+        return_value=ExecutionResult(success=False, output="", error="transient", execution_time=0.1)
+    )
+    manager._execute_prompt(prompt)
+
+    assert prompt.status == PromptStatus.QUEUED  # retried, not failed
+    assert prompt.retry_count == 1

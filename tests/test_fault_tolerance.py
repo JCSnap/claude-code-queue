@@ -119,6 +119,17 @@ def _auth_fail_result(error: str = "Error: Not authenticated. Please run 'claude
     )
 
 
+def _non_retryable_result(error: str = "Error: Claude Code cannot be launched inside another Claude Code session.") -> ExecutionResult:
+    return ExecutionResult(
+        success=False,
+        output="",
+        error=error,
+        execution_time=0.4,
+        is_non_retryable=True,
+        rate_limit_info=RateLimitInfo(is_rate_limited=False),
+    )
+
+
 def _success_result(output: str = "done") -> ExecutionResult:
     return ExecutionResult(
         success=True,
@@ -1831,3 +1842,51 @@ def test_network_loss_then_sigkill_then_restart_full_recovery(tmp_path, mock_ifa
     mgr2._process_queue_iteration()
 
     assert mgr2.state.total_processed == 1
+
+
+# ===========================================================================
+# Non-Retryable Error Scenarios (FT-086..087)
+# ===========================================================================
+
+
+def test_nested_session_error_unlimited_retries_fails_immediately(tmp_path, mocker):  # FT-086
+    """FT-086: nested-session error + max_retries=-1 → prompt reaches failed/ directory."""
+    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
+    mocker.patch.object(ClaudeCodeInterface, "test_connection", return_value=(True, "ok"))
+    mgr = QueueManager(storage_dir=str(tmp_path))
+
+    prompt = QueuedPrompt(id="ft086", content="task", max_retries=-1)
+    mgr.state = mgr.storage.load_queue_state()
+    mgr.state.add_prompt(prompt)
+    mgr.storage.save_queue_state(mgr.state)
+
+    mocker.patch.object(mgr.claude_interface, "execute_prompt", return_value=_non_retryable_result())
+    mgr._process_queue_iteration()
+
+    # Prompt must be in failed/ directory, not still in queue/
+    failed_files = list((tmp_path / "failed").glob("ft086-*.md"))
+    queue_files = list((tmp_path / "queue").glob("ft086-*.md"))
+    assert len(failed_files) == 1
+    assert len(queue_files) == 0
+
+
+def test_nested_session_error_not_picked_up_again(tmp_path, mocker):  # FT-087
+    """FT-087: After a non-retryable fail, the next queue iteration has nothing to execute."""
+    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
+    mocker.patch.object(ClaudeCodeInterface, "test_connection", return_value=(True, "ok"))
+    mgr = QueueManager(storage_dir=str(tmp_path))
+
+    prompt = QueuedPrompt(id="ft087", content="task", max_retries=-1)
+    mgr.state = mgr.storage.load_queue_state()
+    mgr.state.add_prompt(prompt)
+    mgr.storage.save_queue_state(mgr.state)
+
+    execute_mock = mocker.patch.object(
+        mgr.claude_interface, "execute_prompt", return_value=_non_retryable_result()
+    )
+
+    mgr._process_queue_iteration()  # First iteration: non-retryable fail
+    mgr._process_queue_iteration()  # Second iteration: nothing to execute
+
+    # execute_prompt must have been called exactly once
+    assert execute_mock.call_count == 1
