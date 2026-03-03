@@ -195,6 +195,20 @@ class QueueManager:
             self.state.total_processed += 1
             print(f"✓ Prompt {prompt.id} completed successfully")
 
+        elif result.is_non_retryable:
+            # Fix B — Non-retryable error: fail immediately, skip retry counter and can_retry().
+            # Placing is_non_retryable before is_rate_limited in the chain ensures it always
+            # takes precedence; a check nested inside else: would be silently bypassed if both
+            # flags were ever set simultaneously.
+            prompt.status = PromptStatus.FAILED
+            prompt.add_log(f"{execution_summary} - FAILED (non-retryable error, retry budget preserved)")
+            if result.error:
+                prompt.add_log(f"Error: {result.error}")
+            self.state.failed_count += 1
+            print(
+                f"✗ Prompt {prompt.id} failed permanently (non-retryable error, no retry)"
+            )
+
         elif result.is_rate_limited:
             # Fix S4: prompt.status is EXECUTING at this point — checking it against
             # RATE_LIMITED always returns False. Use rate_limited_at (persisted from
@@ -230,7 +244,8 @@ class QueueManager:
                 if result.error:
                     prompt.add_log(f"Error: {result.error}")
                 print(
-                    f"✗ Prompt {prompt.id} failed, will retry ({prompt.retry_count}/{prompt.max_retries})"
+                    f"✗ Prompt {prompt.id} failed, will retry "
+                    f"({prompt.retry_count}/{'∞' if prompt.max_retries == -1 else prompt.max_retries})"
                 )
             else:
                 prompt.status = PromptStatus.FAILED
@@ -239,8 +254,9 @@ class QueueManager:
                     prompt.add_log(f"Error: {result.error}")
 
                 self.state.failed_count += 1
+                retries_str = "∞" if prompt.max_retries == -1 else str(prompt.max_retries)
                 print(
-                    f"✗ Prompt {prompt.id} failed permanently after {prompt.max_retries} attempts"
+                    f"✗ Prompt {prompt.id} failed permanently after {retries_str} attempts"
                 )
 
         self.state.last_processed = datetime.now()

@@ -16,6 +16,8 @@ from claude_code_queue.claude_interface import (
     ClaudeCodeInterface,
     _RATE_LIMIT_MAX_RESET_HOURS,
     _RATE_LIMIT_SCAN_CHARS,
+    _NON_RETRYABLE_SCAN_CHARS,
+    _NON_RETRYABLE_PATTERNS,
 )
 from claude_code_queue.models import QueuedPrompt, RateLimitInfo, PromptStatus
 
@@ -654,3 +656,150 @@ def test_false_positive_not_detected(interface, fp_text):  # S11c
     assert result.is_rate_limited is False, (
         f"False positive triggered by:\n  {fp_text!r}"
     )
+
+
+# ===========================================================================
+# Non-Retryable Error Detection
+# ===========================================================================
+
+
+def test_detect_non_retryable_error_nested_session(interface):  # CLI-NR-001
+    """Nested-session stderr triggers is_non_retryable detection."""
+    stderr = (
+        "Error: Claude Code cannot be launched inside another Claude Code session.\n"
+        "Nested sessions share runtime resources and will crash all active sessions.\n"
+        "To bypass this check, unset the CLAUDECODE environment variable."
+    )
+    assert interface._detect_non_retryable_error(stderr) is True
+
+
+def test_detect_non_retryable_error_ordinary_failure(interface):  # CLI-NR-002
+    """Ordinary failure messages do not trigger non-retryable detection."""
+    assert interface._detect_non_retryable_error("Error: something went wrong") is False
+    assert interface._detect_non_retryable_error("") is False
+    assert interface._detect_non_retryable_error("rate limit exceeded") is False
+
+
+def test_detect_non_retryable_error_case_insensitive(interface):  # CLI-NR-003
+    """Non-retryable pattern matching is case-insensitive."""
+    assert interface._detect_non_retryable_error(
+        "CLAUDE CODE CANNOT BE LAUNCHED INSIDE ANOTHER CLAUDE CODE SESSION."
+    ) is True
+
+
+def test_execute_prompt_sets_is_non_retryable_on_nested_session_error(interface):  # CLI-NR-004
+    """ExecutionResult.is_non_retryable is True when subprocess stderr contains the nested-session message."""
+    nested_session_stderr = (
+        "Error: Claude Code cannot be launched inside another Claude Code session.\n"
+        "To bypass this check, unset the CLAUDECODE environment variable."
+    )
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=1, stdout="", stderr=nested_session_stderr
+        )
+        result = interface.execute_prompt(QueuedPrompt(content="test"))
+    assert result.is_non_retryable is True
+    assert result.success is False
+
+
+def test_execute_prompt_is_non_retryable_false_for_ordinary_failure(interface):  # CLI-NR-005
+    """ExecutionResult.is_non_retryable is False for retryable subprocess errors."""
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=1, stdout="", stderr="some random error"
+        )
+        result = interface.execute_prompt(QueuedPrompt(content="test"))
+    assert result.is_non_retryable is False
+
+
+def test_detect_non_retryable_error_ignores_phrase_beyond_scan_window(interface):  # CLI-NR-006
+    """A non-retryable phrase that appears only AFTER _NON_RETRYABLE_SCAN_CHARS characters
+    must NOT trigger detection — same discipline as the S11b rate-limit scan-window guard.
+    """
+    prefix = "x" * _NON_RETRYABLE_SCAN_CHARS
+    assert interface._detect_non_retryable_error(
+        prefix + "\n" + _NON_RETRYABLE_PATTERNS[0]
+    ) is False
+
+
+def test_detect_non_retryable_error_fires_at_last_char_of_scan_window(interface):  # CLI-NR-007
+    """A pattern whose final character sits at index _NON_RETRYABLE_SCAN_CHARS - 1
+    (the last position inside the window) is still detected.
+
+    Validates the boundary is inclusive: stderr[:N] includes index N-1.
+    """
+    pattern = _NON_RETRYABLE_PATTERNS[0]
+    prefix = "x" * (_NON_RETRYABLE_SCAN_CHARS - len(pattern))
+    assert interface._detect_non_retryable_error(
+        prefix + pattern + "x" * 1000
+    ) is True
+
+
+# ===========================================================================
+# CLAUDECODE Environment Stripping
+# ===========================================================================
+
+
+def test_execute_prompt_strips_claudecode_from_env(interface, monkeypatch):  # CLI-ENV-001
+    """CLAUDECODE is removed from the subprocess environment."""
+    monkeypatch.setenv("CLAUDECODE", "1")
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+        interface.execute_prompt(QueuedPrompt(content="test"))
+    _, kwargs = mock_run.call_args
+    assert "CLAUDECODE" not in kwargs["env"]
+
+
+def test_execute_prompt_preserves_other_env_vars(interface, monkeypatch):  # CLI-ENV-002
+    """Other environment variables (e.g. PATH, HOME) are passed through unchanged."""
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("MY_CUSTOM_VAR", "hello")
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+        interface.execute_prompt(QueuedPrompt(content="test"))
+    _, kwargs = mock_run.call_args
+    assert "MY_CUSTOM_VAR" in kwargs["env"]
+    assert kwargs["env"]["MY_CUSTOM_VAR"] == "hello"
+    assert "PATH" in kwargs["env"]
+
+
+def test_execute_prompt_env_strip_noop_when_claudecode_absent(interface, monkeypatch):  # CLI-ENV-003
+    """If CLAUDECODE is not set, the env passed to subprocess is otherwise intact."""
+    monkeypatch.delenv("CLAUDECODE", raising=False)
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+        interface.execute_prompt(QueuedPrompt(content="test"))
+    _, kwargs = mock_run.call_args
+    assert "CLAUDECODE" not in kwargs["env"]
+    assert "PATH" in kwargs["env"]  # rest of env is intact
+
+
+def test_verify_claude_available_strips_claudecode_from_env(mocker, monkeypatch):  # CLI-ENV-004
+    """_verify_claude_available() strips CLAUDECODE from the --version subprocess."""
+    monkeypatch.setenv("CLAUDECODE", "1")
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="2.1.50 (Claude Code)", stderr="")
+        ClaudeCodeInterface(claude_command="claude", timeout=60)
+    _, kwargs = mock_run.call_args
+    assert "env" in kwargs
+    assert "CLAUDECODE" not in kwargs["env"]
+
+
+def test_test_connection_strips_claudecode_from_env(interface, monkeypatch):  # CLI-ENV-005
+    """test_connection() strips CLAUDECODE from the --help subprocess."""
+    monkeypatch.setenv("CLAUDECODE", "1")
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        interface.test_connection()
+    _, kwargs = mock_run.call_args
+    assert "CLAUDECODE" not in kwargs["env"]
+
+
+def test_get_available_commands_strips_claudecode_from_env(interface, monkeypatch):  # CLI-ENV-006
+    """get_available_commands() strips CLAUDECODE from the --help subprocess."""
+    monkeypatch.setenv("CLAUDECODE", "1")
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        interface.get_available_commands()
+    _, kwargs = mock_run.call_args
+    assert "CLAUDECODE" not in kwargs["env"]

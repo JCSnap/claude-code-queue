@@ -2,6 +2,7 @@
 Interface for executing prompts via Claude Code CLI.
 """
 
+import os
 import re
 import shutil
 import subprocess
@@ -29,6 +30,25 @@ _RATE_LIMIT_MAX_RESET_HOURS = 24
 # CLI output this equals the byte count.
 _RATE_LIMIT_SCAN_CHARS = 2048
 
+# Only scan this many characters of stderr for non-retryable patterns.
+# The nested-session message is short (≤ ~200 chars) and appears near the top
+# of stderr. The cap mirrors the _RATE_LIMIT_SCAN_CHARS guard: it prevents a
+# subprocess tool whose verbose debug output happens to contain a matching phrase
+# from triggering a false positive. Set larger than _RATE_LIMIT_SCAN_CHARS (2 048)
+# because future non-retryable patterns may appear after longer preambles.
+_NON_RETRYABLE_SCAN_CHARS = 8192
+
+# Errors that are structurally permanent — retrying will never produce a different
+# outcome. When any of these substrings is found in the first _NON_RETRYABLE_SCAN_CHARS
+# characters of stderr (case-insensitive), the ExecutionResult is marked
+# is_non_retryable=True and _process_execution_result() will skip the retry logic
+# and immediately mark the prompt FAILED.
+#
+# Keep patterns specific enough to avoid false positives.
+_NON_RETRYABLE_PATTERNS = [
+    "claude code cannot be launched inside another claude code session",
+]
+
 
 class ClaudeCodeInterface:
     """Interface for executing prompts via Claude Code CLI."""
@@ -52,11 +72,13 @@ class ClaudeCodeInterface:
                 if resolved:
                     self.claude_command = resolved
 
+            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
             result = subprocess.run(
                 [self.claude_command, "--version"],
                 capture_output=True,
                 text=True,
                 timeout=10,
+                env=subprocess_env,
             )
             if result.returncode != 0:
                 raise RuntimeError(f"Claude Code CLI not available: {result.stderr}")
@@ -137,9 +159,13 @@ class ClaudeCodeInterface:
             # E1 — Use cwd= instead of os.chdir() to set the subprocess working directory.
             # This is thread-safe: os.chdir() changes the entire process CWD, which breaks
             # concurrent executions and any other thread that relies on getcwd().
+            # Fix A — Strip CLAUDECODE so nested claude invocations are not blocked by the
+            # anti-nesting guard. The rest of the environment (PATH, HOME, API keys, etc.)
+            # is preserved unchanged.
+            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=self.timeout,
-                cwd=str(working_dir)
+                cwd=str(working_dir), env=subprocess_env
             )
 
             execution_time = time.time() - start_time
@@ -150,6 +176,7 @@ class ClaudeCodeInterface:
             # Caveat: if older versions of the `claude` CLI write rate-limit messages to
             # stdout, this change will miss them (see _STDERR_RATE_LIMIT_MIN_VERSION).
             rate_limit_info = self._detect_rate_limit(result.stderr)
+            is_non_retryable = self._detect_non_retryable_error(result.stderr)
 
             success = result.returncode == 0 and not rate_limit_info.is_rate_limited
 
@@ -159,6 +186,7 @@ class ClaudeCodeInterface:
                 error=result.stderr,
                 rate_limit_info=rate_limit_info,
                 execution_time=execution_time,
+                is_non_retryable=is_non_retryable,
             )
 
         except subprocess.TimeoutExpired:
@@ -210,6 +238,20 @@ class ClaudeCodeInterface:
                 )
 
         return RateLimitInfo(is_rate_limited=False)
+
+    def _detect_non_retryable_error(self, stderr: str) -> bool:
+        """Return True if stderr contains a non-retryable error pattern.
+
+        Only the first _NON_RETRYABLE_SCAN_CHARS characters of stderr are scanned.
+        The nested-session message appears within the first ~200 chars, so the cap
+        never misses it; the cap does prevent long tool output from triggering false
+        positives if a future pattern is less specific.
+
+        Matching is case-insensitive: each pattern is lowercased at match time, so
+        entries in _NON_RETRYABLE_PATTERNS may be any case.
+        """
+        scan_window = stderr[:_NON_RETRYABLE_SCAN_CHARS].lower()
+        return any(pattern.lower() in scan_window for pattern in _NON_RETRYABLE_PATTERNS)
 
     def _extract_reset_time_from_limit_message(self, output: str) -> Optional[datetime]:
         """Extract reset time from Claude's limit message."""
@@ -291,11 +333,13 @@ class ClaudeCodeInterface:
     def test_connection(self) -> Tuple[bool, str]:
         """Test if Claude Code is working."""
         try:
+            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
             result = subprocess.run(
                 [self.claude_command, "--help"],
                 capture_output=True,
                 text=True,
                 timeout=10,
+                env=subprocess_env,
             )
 
             if result.returncode == 0:
@@ -313,11 +357,13 @@ class ClaudeCodeInterface:
     def get_available_commands(self) -> List[str]:
         """Get available Claude Code commands."""
         try:
+            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
             result = subprocess.run(
                 [self.claude_command, "--help"],
                 capture_output=True,
                 text=True,
                 timeout=10,
+                env=subprocess_env,
             )
 
             if result.returncode == 0:

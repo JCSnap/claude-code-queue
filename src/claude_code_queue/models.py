@@ -208,6 +208,7 @@ class ExecutionResult:
     error: str = ""
     rate_limit_info: Optional[RateLimitInfo] = None
     execution_time: float = 0.0
+    is_non_retryable: bool = False  # True if the error is permanent regardless of retry count
 
     @property
     def is_rate_limited(self) -> bool:
