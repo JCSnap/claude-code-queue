@@ -5,10 +5,8 @@ Covers: argument parsing, global option forwarding, command dispatch,
 output format (text and JSON), bank sub-commands, prompt-box passthrough,
 and exit codes for every command.
 
-Commands that use QueueManager (start, test) mock ``QueueManager``.
-All other commands mock ``QueueStorage`` directly, matching the E3 refactor
-in commit 38cbd3c which removed the QueueManager dependency from non-daemon
-subcommands.
+Storage commands mock ``QueueStorage``; commands that invoke claude mock ``QueueManager``.
+Commands are exercised by patching ``sys.argv`` and calling ``main()``.
 """
 
 import json
@@ -243,6 +241,15 @@ class TestAddCommand:
         code, _ = self._run_add(success=False)
         assert code == 1
 
+    def test_add_passes_storage_dir_to_storage(self):
+        with patch("sys.argv", ["claude-queue", "--storage-dir", "/custom/path", "add", "hello"]):
+            with patch("claude_code_queue.cli.QueueStorage") as mock_cls:
+                mock_cls.return_value._save_single_prompt.return_value = True
+                main()
+                mock_cls.assert_called_once()  # guard: fails clearly if storage was never constructed
+                _, kwargs = mock_cls.call_args
+                assert kwargs["storage_dir"] == "/custom/path"
+
 
 # ===========================================================================
 # `template` Command
@@ -398,34 +405,61 @@ class TestStatusCommand:
 # ===========================================================================
 
 class TestCancelCommand:
-    def _run_cancel(self, prompt_id, found=True, save_success=True):
-        prompts = (
-            [QueuedPrompt(id=prompt_id, content="test", status=PromptStatus.QUEUED)]
-            if found
-            else []
-        )
-        state = _make_state(prompts=prompts)
+    def _run_cancel(self, prompt_id, success=True):
+        # Build a real QueueState containing the target prompt so that
+        # state.get_prompt(prompt_id) returns it instead of None.
+        target_prompt = QueuedPrompt(id=prompt_id, content="some content")
+        state = _make_state(prompts=[target_prompt])
+
         with patch("sys.argv", ["claude-queue", "cancel", prompt_id]):
             with patch("claude_code_queue.cli.QueueStorage") as mock_cls:
                 storage = MagicMock()
                 storage.load_queue_state.return_value = state
-                storage._save_single_prompt.return_value = save_success
+                # Note: call_args captures a reference to the QueuedPrompt dataclass,
+                # not a snapshot. Assertions on call_args[0][0] see the object's state
+                # at assertion time. cmd_cancel does not modify the prompt after calling
+                # _save_single_prompt, so this is safe.
+                storage._save_single_prompt.return_value = success
                 mock_cls.return_value = storage
                 code = main()
                 return code, storage
 
-    def test_cancel_calls_remove_prompt_with_id(self):
+    def test_cancel_marks_prompt_cancelled_and_saves(self):
         _, storage = self._run_cancel("abc123")
-        prompt = storage._save_single_prompt.call_args[0][0]
-        assert prompt.id == "abc123"
-        assert prompt.status == PromptStatus.CANCELLED
+        storage._save_single_prompt.assert_called_once()
+        saved_prompt = storage._save_single_prompt.call_args[0][0]
+        assert saved_prompt.id == "abc123"
+        assert saved_prompt.status == PromptStatus.CANCELLED
 
     def test_cancel_returns_zero_on_success(self):
-        code, _ = self._run_cancel("abc123", found=True, save_success=True)
+        code, _ = self._run_cancel("abc123", success=True)
         assert code == 0
 
     def test_cancel_returns_one_on_failure(self):
-        code, _ = self._run_cancel("abc123", found=False)
+        code, _ = self._run_cancel("abc123", success=False)
+        assert code == 1
+
+    def test_cancel_prompt_not_found_returns_one(self):
+        state = _make_state(prompts=[])  # target ID absent from queue
+        with patch("sys.argv", ["claude-queue", "cancel", "abc123"]):
+            with patch("claude_code_queue.cli.QueueStorage") as mock_cls:
+                storage = MagicMock()
+                storage.load_queue_state.return_value = state
+                mock_cls.return_value = storage
+                code = main()
+        assert code == 1
+
+    def test_cancel_executing_prompt_returns_one(self):
+        target_prompt = QueuedPrompt(
+            id="abc123", content="x", status=PromptStatus.EXECUTING
+        )
+        state = _make_state(prompts=[target_prompt])
+        with patch("sys.argv", ["claude-queue", "cancel", "abc123"]):
+            with patch("claude_code_queue.cli.QueueStorage") as mock_cls:
+                storage = MagicMock()
+                storage.load_queue_state.return_value = state
+                mock_cls.return_value = storage
+                code = main()
         assert code == 1
 
 
@@ -499,7 +533,7 @@ class TestListCommand:
     def test_list_invalid_status_is_argparse_error(self):
         with pytest.raises(SystemExit) as exc_info:
             with patch("sys.argv", ["claude-queue", "list", "--status", "invalid_value"]):
-                with patch("claude_code_queue.cli.QueueManager"):
+                with patch("claude_code_queue.cli.QueueStorage"):
                     main()
         assert exc_info.value.code != 0
 
@@ -714,11 +748,12 @@ class TestBankUseCommand:
         with patch("sys.argv", ["claude-queue", "bank", "use", "my-template"]):
             with patch("claude_code_queue.cli.QueueStorage") as mock_cls:
                 storage = MagicMock()
-                if success:
-                    storage.use_bank_template.return_value = QueuedPrompt(content="test")
-                    storage._save_single_prompt.return_value = True
-                else:
-                    storage.use_bank_template.return_value = None
+                # use_bank_template must return a real QueuedPrompt so the CLI
+                # doesn't short-circuit with "Template not found".
+                # For success=False we still return a prompt but
+                # _save_single_prompt returns False.
+                storage.use_bank_template.return_value = QueuedPrompt(content="tmpl")
+                storage._save_single_prompt.return_value = success
                 mock_cls.return_value = storage
                 return main(), storage
 
@@ -730,8 +765,17 @@ class TestBankUseCommand:
         code, _ = self._run_bank_use(success=True)
         assert code == 0
 
-    def test_bank_use_returns_one_on_failure(self):
+    def test_bank_use_returns_one_when_save_fails(self):
         code, _ = self._run_bank_use(success=False)
+        assert code == 1
+
+    def test_bank_use_returns_one_when_template_not_found(self):
+        with patch("sys.argv", ["claude-queue", "bank", "use", "my-template"]):
+            with patch("claude_code_queue.cli.QueueStorage") as mock_cls:
+                storage = MagicMock()
+                storage.use_bank_template.return_value = None  # template absent
+                mock_cls.return_value = storage
+                code = main()
         assert code == 1
 
 
@@ -766,6 +810,11 @@ class TestBankDeleteCommand:
 # ===========================================================================
 
 class TestBankNoSubcommand:
+    """
+    cmd_bank returns 1 before constructing any storage when no subcommand is given.
+    The QueueManager patch is a no-op guard against accidental instantiation.
+    """
+
     def _run_bank_no_subcommand(self):
         with patch("sys.argv", ["claude-queue", "bank"]):
             with patch("claude_code_queue.cli.QueueManager") as mock_cls:
@@ -793,8 +842,8 @@ class TestBankNoSubcommand:
 
 class TestPromptBoxCommand:
     """
-    cmd_prompt_box does not use the manager, but QueueManager is still
-    instantiated in main() before the command dispatch, so we always mock it.
+    cmd_prompt_box does not use QueueManager or QueueStorage. The patch is
+    retained as a no-op guard against accidental QueueManager instantiation.
     shutil is imported inside the function, so we patch shutil.which directly.
     """
 
