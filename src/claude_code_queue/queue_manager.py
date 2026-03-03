@@ -56,9 +56,9 @@ class QueueManager:
 
         try:
             while self.running:
-                self._process_queue_iteration(callback)
+                did_work = self._process_queue_iteration(callback)
 
-                if self.running:
+                if self.running and not did_work:
                     time.sleep(self.check_interval)
 
         except KeyboardInterrupt:
@@ -89,8 +89,8 @@ class QueueManager:
 
     def _process_queue_iteration(
         self, callback: Optional[Callable[[QueueState], None]] = None
-    ) -> None:
-        """Process one iteration of the queue."""
+    ) -> bool:
+        """Process one iteration of the queue. Returns True if a prompt was executed."""
         previous_total_processed = self.state.total_processed if self.state else 0
         previous_failed_count = self.state.failed_count if self.state else 0
         previous_rate_limited_count = self.state.rate_limited_count if self.state else 0
@@ -126,7 +126,7 @@ class QueueManager:
 
             if callback:
                 callback(self.state)
-            return
+            return False
 
         print(f"Executing prompt {next_prompt.id}: {next_prompt.content[:50]}...")
         self._execute_prompt(next_prompt)
@@ -135,6 +135,7 @@ class QueueManager:
 
         if callback:
             callback(self.state)
+        return True
 
     def _check_rate_limited_prompts(self) -> None:
         """Check if any rate-limited prompts should be retried."""
