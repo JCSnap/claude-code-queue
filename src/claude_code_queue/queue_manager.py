@@ -2,6 +2,7 @@
 Queue manager with execution loop.
 """
 
+import os
 import sys
 import time
 import signal
@@ -44,7 +45,13 @@ class QueueManager:
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals."""
-        print(f"\nReceived signal {signum}, shutting down gracefully...")
+        # Signal-safe stderr write — avoids re-entering print()'s stream lock
+        # if the main thread is mid-print when the signal fires.
+        try:
+            os.write(2, f"\nReceived signal {signum}, shutting down gracefully...\n".encode())
+        except OSError:
+            pass
+        self.claude_interface.kill_current()  # unblocks communicate() if executing
         self.stop()
 
     def start(self, callback: Optional[Callable[[QueueState], None]] = None) -> None:
@@ -88,6 +95,8 @@ class QueueManager:
                     time.sleep(self.check_interval)
 
         except KeyboardInterrupt:
+            # print() is safe: we are in normal execution context, not signal-handler
+            # context.  The signal handler used os.write(2, ...) and has already returned.
             print("\nShutdown requested by user")
         except Exception as e:
             print(f"Error in queue processing: {e}")
@@ -100,6 +109,9 @@ class QueueManager:
 
     def _shutdown(self) -> None:
         """Clean shutdown procedure."""
+        # print() is safe here: _shutdown() runs from the finally block in start(),
+        # which is normal execution context (not signal-handler context).  The signal
+        # handler itself uses os.write(2, ...) to avoid stream-lock re-entrance.
         print("Shutting down...")
 
         if self.state:
@@ -233,6 +245,9 @@ class QueueManager:
 
         self.storage.save_queue_state(self.state)
 
+        # execute_prompt() may raise KeyboardInterrupt (Ctrl+C path).
+        # _process_execution_result() is intentionally bypassed in that case;
+        # the prompt stays EXECUTING for _shutdown() to revert to QUEUED.
         result = self.claude_interface.execute_prompt(prompt)
 
         self._process_execution_result(prompt, result)

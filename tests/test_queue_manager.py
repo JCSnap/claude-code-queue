@@ -5,6 +5,8 @@ ClaudeCodeInterface.execute_prompt is patched for all execution tests.
 The manager fixture uses tmp_path so every test gets a fresh storage dir.
 """
 
+import signal
+import threading
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch, PropertyMock
 
@@ -719,4 +721,114 @@ def test_cooldown_prompt_does_not_print_no_prompts_in_queue(manager, capsys):  #
     )
     assert "retry cooldown" in captured.out.lower(), (
         "Must print a message indicating the prompt is in retry cooldown"
+    )
+
+
+# ===========================================================================
+# Interrupt / Signal Handling (QMG-INT)
+# ===========================================================================
+
+
+def test_signal_handler_calls_kill_current_before_stop(manager):  # QMG-INT-001
+    """_signal_handler() calls kill_current() before stop() (verify ordering)."""
+    call_log = []
+
+    manager.claude_interface.kill_current = MagicMock(
+        side_effect=lambda: call_log.append("kill_current")
+    )
+    original_stop = manager.stop
+    manager.stop = MagicMock(
+        side_effect=lambda: (call_log.append("stop"), original_stop())
+    )
+
+    manager._signal_handler(signal.SIGINT, None)
+
+    assert call_log == ["kill_current", "stop"], (
+        f"Expected kill_current before stop, got {call_log}"
+    )
+
+
+def test_keyboard_interrupt_bypasses_process_execution_result(manager, mocker):  # QMG-INT-002
+    """When execute_prompt() raises KeyboardInterrupt, _process_execution_result()
+    is bypassed and the prompt remains EXECUTING.
+    """
+    prompt = QueuedPrompt(id="test01", content="task")
+    manager.state = manager.storage.load_queue_state()
+    manager.state.add_prompt(prompt)
+
+    mocker.patch.object(
+        manager.claude_interface, "execute_prompt",
+        side_effect=KeyboardInterrupt
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        manager._execute_prompt(prompt)
+
+    assert prompt.status == PromptStatus.EXECUTING
+
+
+def test_end_to_end_signal_shutdown_reverts_prompt(manager, mocker):  # QMG-INT-003
+    """End-to-end: signal → kill_current → KeyboardInterrupt → _shutdown() → QUEUED.
+
+    WARNING: This test exercises true cross-thread access to _current_process
+    and _interrupted WITHOUT locks.  This is safe under the GIL (CPython) but
+    will race under free-threaded Python (PEP 703, --disable-gil).  If
+    free-threaded builds become a target, the production code must add
+    synchronization (not just this test).
+    """
+    prompt = QueuedPrompt(id="test02", content="task")
+    state = manager.storage.load_queue_state()
+    state.add_prompt(prompt)
+    manager.storage.save_queue_state(state)
+    manager.state = None
+
+    # Event to synchronize the mock communicate() with the signal handler
+    communicate_started = threading.Event()
+    signal_sent = threading.Event()
+
+    def mock_communicate(timeout=None):
+        communicate_started.set()
+        signal_sent.wait(timeout=5)
+        # After signal handler ran, _interrupted should be True
+        return ("output", "")
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 99999
+    mock_proc.communicate.side_effect = mock_communicate
+    mock_proc.returncode = 0
+    mock_proc.wait.return_value = 0
+
+    execution_error = []
+
+    def run_iteration():
+        try:
+            manager._process_queue_iteration()
+        except KeyboardInterrupt:
+            execution_error.append("KeyboardInterrupt")
+
+    mocker.patch("subprocess.Popen", return_value=mock_proc)
+    mocker.patch.object(ClaudeCodeInterface, "_kill_proc_group", return_value=True)
+
+    worker = threading.Thread(target=run_iteration)
+    worker.start()
+
+    # Wait for communicate() to start, then send signal
+    assert communicate_started.wait(timeout=5), "communicate() did not start"
+    manager._signal_handler(signal.SIGINT, None)
+    signal_sent.set()
+
+    worker.join(timeout=5)
+    assert not worker.is_alive(), "Worker thread did not finish"
+    assert "KeyboardInterrupt" in execution_error
+
+    # Verify _shutdown() reverts prompt to QUEUED
+    manager._shutdown()
+
+    reloaded = manager.storage.load_queue_state()
+    prompt_after = next(
+        (pr for pr in reloaded.prompts if pr.id == "test02"), None
+    )
+    assert prompt_after is not None, "Prompt must survive shutdown"
+    assert prompt_after.status == PromptStatus.QUEUED, (
+        f"Expected QUEUED after shutdown, got {prompt_after.status}"
     )

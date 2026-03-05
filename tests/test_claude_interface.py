@@ -6,6 +6,7 @@ so the constructor never actually calls the claude binary.
 """
 
 import subprocess
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -18,8 +19,32 @@ from claude_code_queue.claude_interface import (
     _RATE_LIMIT_SCAN_CHARS,
     _NON_RETRYABLE_SCAN_CHARS,
     _NON_RETRYABLE_PATTERNS,
+    _SIGKILL,
+    _SIGTERM,
 )
 from claude_code_queue.models import QueuedPrompt, RateLimitInfo, PromptStatus
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def make_mock_proc(returncode=0, stdout="done", stderr="", pid=99999):
+    """Create a mock Popen object with sensible defaults for all attributes
+    the production code touches.
+
+    IMPORTANT: ``pid`` must be an int (not MagicMock) — ``os.killpg()``
+    raises ``TypeError`` for non-int values.  ``wait()`` returns the
+    returncode so the escalation thread's ``p.wait(timeout=...)`` behaves
+    correctly (returns an int, not a MagicMock).
+    """
+    proc = MagicMock()
+    proc.communicate.return_value = (stdout, stderr)
+    proc.returncode = returncode
+    proc.pid = pid
+    proc.wait.return_value = returncode
+    return proc
 
 
 # ===========================================================================
@@ -105,39 +130,27 @@ def test_rate_limit_detected_in_stderr(interface):  # CLI-009
     execute_prompt() passes result.stderr (only) to _detect_rate_limit(),
     so messages in stderr are correctly caught.
     """
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(
-            returncode=1, stdout="", stderr="usage limit reached"
-        )
+    mock_proc = make_mock_proc(returncode=1, stdout="", stderr="usage limit reached")
+    with patch("subprocess.Popen", return_value=mock_proc):
         result = interface.execute_prompt(QueuedPrompt(content="task"))
     assert result.rate_limit_info.is_rate_limited is True
     assert result.success is False
 
 
-def test_rate_limit_detected_in_stderr_only(mocker):  # CLI-010
+def test_rate_limit_detected_in_stderr_only(interface):  # CLI-010
     """Rate-limit phrase in stderr → is_rate_limited=True."""
-    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
-    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
-
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(
-            returncode=1, stdout="", stderr="usage limit reached"
-        )
-        result = iface.execute_prompt(QueuedPrompt(content="task"))
+    mock_proc = make_mock_proc(returncode=1, stdout="", stderr="usage limit reached")
+    with patch("subprocess.Popen", return_value=mock_proc):
+        result = interface.execute_prompt(QueuedPrompt(content="task"))
 
     assert result.rate_limit_info.is_rate_limited is True
 
 
-def test_rate_limit_in_stdout_only_not_detected(mocker):  # CLI-011
+def test_rate_limit_in_stdout_only_not_detected(interface):  # CLI-011
     """Rate-limit phrase only in stdout → is_rate_limited=False (no false positive)."""
-    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
-    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
-
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout="usage limit reached", stderr=""
-        )
-        result = iface.execute_prompt(QueuedPrompt(content="task"))
+    mock_proc = make_mock_proc(returncode=0, stdout="usage limit reached", stderr="")
+    with patch("subprocess.Popen", return_value=mock_proc):
+        result = interface.execute_prompt(QueuedPrompt(content="task"))
 
     assert result.rate_limit_info.is_rate_limited is False
     assert result.success is True
@@ -278,26 +291,26 @@ def test_estimate_reset_time_at_exact_boundary_hour_5(interface):  # CLI-023
 
 def test_execute_prompt_calls_claude_with_print_flag(interface):  # CLI-024
     """execute_prompt() calls the claude binary with --print."""
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="done", stderr="")
+    mock_proc = make_mock_proc()
+    with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
         interface.execute_prompt(QueuedPrompt(content="test task"))
-        args = mock_run.call_args[0][0]
+        args = mock_popen.call_args[0][0]
         assert "--print" in args
 
 
 def test_execute_prompt_includes_dangerously_skip_permissions(interface):  # CLI-025
     """execute_prompt() includes --dangerously-skip-permissions in the command."""
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="done", stderr="")
+    mock_proc = make_mock_proc()
+    with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
         interface.execute_prompt(QueuedPrompt(content="test task"))
-        args = mock_run.call_args[0][0]
+        args = mock_popen.call_args[0][0]
         assert "--dangerously-skip-permissions" in args
 
 
 def test_execute_prompt_success_returns_success_result(interface):  # CLI-026
     """returncode=0 with no rate-limit output → success=True."""
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="All done", stderr="")
+    mock_proc = make_mock_proc(returncode=0, stdout="All done", stderr="")
+    with patch("subprocess.Popen", return_value=mock_proc):
         result = interface.execute_prompt(QueuedPrompt(content="task"))
         assert result.success is True
         assert result.output == "All done"
@@ -305,20 +318,16 @@ def test_execute_prompt_success_returns_success_result(interface):  # CLI-026
 
 def test_execute_prompt_failure_returns_failure_result(interface):  # CLI-027
     """Non-zero returncode → success=False."""
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(
-            returncode=1, stdout="", stderr="Something went wrong"
-        )
+    mock_proc = make_mock_proc(returncode=1, stdout="", stderr="Something went wrong")
+    with patch("subprocess.Popen", return_value=mock_proc):
         result = interface.execute_prompt(QueuedPrompt(content="task"))
         assert result.success is False
 
 
 def test_execute_prompt_rate_limit_in_stdout_not_detected(interface):  # CLI-028
     """Rate-limit text only in stdout is NOT detected (stderr-only detection)."""
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout="usage limit reached", stderr=""
-        )
+    mock_proc = make_mock_proc(returncode=0, stdout="usage limit reached", stderr="")
+    with patch("subprocess.Popen", return_value=mock_proc):
         result = interface.execute_prompt(QueuedPrompt(content="task"))
         assert result.rate_limit_info.is_rate_limited is False
         assert result.success is True
@@ -337,10 +346,10 @@ def test_execute_prompt_with_context_files_includes_at_references(
         context_files=["README.md"],
     )
 
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+    mock_proc = make_mock_proc(returncode=0, stdout="", stderr="")
+    with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
         interface.execute_prompt(prompt)
-        call_args = mock_run.call_args[0][0]
+        call_args = mock_popen.call_args[0][0]
         full_cmd = " ".join(call_args)
         assert "@README.md" in full_cmd, (
             f"Expected '@README.md' in command args: {call_args}"
@@ -348,16 +357,16 @@ def test_execute_prompt_with_context_files_includes_at_references(
 
 
 def test_execute_prompt_uses_working_directory(interface, tmp_path):  # CLI-030
-    """execute_prompt() passes cwd= to subprocess.run instead of os.chdir()."""
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+    """execute_prompt() passes cwd= to subprocess.Popen instead of os.chdir()."""
+    mock_proc = make_mock_proc(returncode=0, stdout="", stderr="")
+    with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
         prompt = QueuedPrompt(content="task", working_directory=str(tmp_path))
         interface.execute_prompt(prompt)
 
     expected = str(tmp_path.resolve())
-    call_kwargs = mock_run.call_args[1]
+    call_kwargs = mock_popen.call_args[1]
     assert "cwd" in call_kwargs, (
-        f"Expected 'cwd' kwarg in subprocess.run call; got kwargs: {call_kwargs}"
+        f"Expected 'cwd' kwarg in subprocess.Popen call; got kwargs: {call_kwargs}"
     )
     assert call_kwargs["cwd"] == expected, (
         f"Expected cwd={expected!r}; got cwd={call_kwargs['cwd']!r}"
@@ -371,10 +380,10 @@ def test_execute_prompt_skips_nonexistent_context_files(interface, tmp_path):  #
         working_directory=str(tmp_path),
         context_files=["nonexistent.py", "also-missing.py"],
     )
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+    mock_proc = make_mock_proc(returncode=0, stdout="", stderr="")
+    with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
         interface.execute_prompt(prompt)
-        call_args = mock_run.call_args[0][0]
+        call_args = mock_popen.call_args[0][0]
         full_cmd = " ".join(call_args)
         assert "@nonexistent.py" not in full_cmd
         assert "@also-missing.py" not in full_cmd
@@ -382,13 +391,17 @@ def test_execute_prompt_skips_nonexistent_context_files(interface, tmp_path):  #
 
 def test_execute_prompt_timeout_returns_failure_result(interface):  # CLI-032
     """subprocess.TimeoutExpired → success=False with 'timed out' in error."""
-    with patch("subprocess.run") as mock_run:
-        mock_run.side_effect = subprocess.TimeoutExpired(cmd="claude", timeout=60)
+    mock_proc = make_mock_proc()
+    mock_proc.communicate.side_effect = subprocess.TimeoutExpired(cmd=["claude"], timeout=60)
+
+    with patch("subprocess.Popen", return_value=mock_proc), \
+         patch.object(ClaudeCodeInterface, "_kill_proc_group"):
         result = interface.execute_prompt(QueuedPrompt(content="task"))
-        assert result.success is False
-        assert "timed out" in result.error.lower(), (
-            f"Expected 'timed out' in error message, got: {result.error!r}"
-        )
+
+    assert result.success is False
+    assert "timed out" in result.error.lower(), (
+        f"Expected 'timed out' in error message, got: {result.error!r}"
+    )
 
 
 # ===========================================================================
@@ -427,7 +440,8 @@ def test_version_warning_emitted_for_old_claude(mocker, capsys):  # CLI-035
             stderr="",
         ),
     )
-    ClaudeCodeInterface(claude_command="claude", timeout=60)
+    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
+    iface.close()
     captured = capsys.readouterr()
     assert "Warning" in captured.err
     assert "2.1.50" in captured.err
@@ -443,7 +457,8 @@ def test_version_warning_not_emitted_for_current_claude(mocker, capsys):  # CLI-
             stderr="",
         ),
     )
-    ClaudeCodeInterface(claude_command="claude", timeout=60)
+    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
+    iface.close()
     captured = capsys.readouterr()
     assert "Warning" not in captured.err
 
@@ -453,15 +468,12 @@ def test_version_warning_not_emitted_for_current_claude(mocker, capsys):  # CLI-
 # ===========================================================================
 
 
-def test_skip_permissions_true_includes_flag(mocker):  # CLI-037
+def test_skip_permissions_true_includes_flag(interface):  # CLI-037
     """skip_permissions=True (default) → --dangerously-skip-permissions in cmd."""
-    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
-    iface = ClaudeCodeInterface(claude_command="claude", timeout=60, skip_permissions=True)
-
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="done", stderr="")
-        iface.execute_prompt(QueuedPrompt(content="task"))
-        args = mock_run.call_args[0][0]
+    mock_proc = make_mock_proc()
+    with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+        interface.execute_prompt(QueuedPrompt(content="task"))
+        args = mock_popen.call_args[0][0]
 
     assert "--dangerously-skip-permissions" in args
 
@@ -471,26 +483,24 @@ def test_skip_permissions_false_omits_flag(mocker):  # CLI-038
     mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
     iface = ClaudeCodeInterface(claude_command="claude", timeout=60, skip_permissions=False)
 
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="done", stderr="")
+    mock_proc = make_mock_proc()
+    with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
         iface.execute_prompt(QueuedPrompt(content="task"))
-        args = mock_run.call_args[0][0]
+        args = mock_popen.call_args[0][0]
 
+    iface.close()
     assert "--dangerously-skip-permissions" not in args
     assert "--print" in args
 
 
-def test_out_of_home_working_directory_emits_warning(mocker, tmp_path, capsys):  # CLI-039
+def test_out_of_home_working_directory_emits_warning(interface, tmp_path, capsys):  # CLI-039
     """working_directory outside home → warning on stderr."""
-    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
-    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
-
     prompt = QueuedPrompt(content="task", working_directory="/tmp")
 
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+    mock_proc = make_mock_proc(returncode=0, stdout="", stderr="")
+    with patch("subprocess.Popen", return_value=mock_proc):
         with patch("pathlib.Path.home", return_value=Path("/home/testuser")):
-            iface.execute_prompt(prompt)
+            interface.execute_prompt(prompt)
 
     captured = capsys.readouterr()
     assert "Warning" in captured.err or "warning" in captured.err.lower(), (
@@ -498,17 +508,14 @@ def test_out_of_home_working_directory_emits_warning(mocker, tmp_path, capsys): 
     )
 
 
-def test_in_home_working_directory_no_warning(mocker, tmp_path, capsys):  # CLI-040
+def test_in_home_working_directory_no_warning(interface, tmp_path, capsys):  # CLI-040
     """working_directory inside home → no warning on stderr."""
-    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
-    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
-
     prompt = QueuedPrompt(content="task", working_directory=str(tmp_path))
 
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+    mock_proc = make_mock_proc(returncode=0, stdout="", stderr="")
+    with patch("subprocess.Popen", return_value=mock_proc):
         with patch("pathlib.Path.home", return_value=tmp_path.parent):
-            iface.execute_prompt(prompt)
+            interface.execute_prompt(prompt)
 
     captured = capsys.readouterr()
     assert "Warning" not in captured.err, (
@@ -516,10 +523,8 @@ def test_in_home_working_directory_no_warning(mocker, tmp_path, capsys):  # CLI-
     )
 
 
-def test_cap_reset_time_limits_far_future_timestamp(mocker):  # CLI-041
+def test_cap_reset_time_limits_far_future_timestamp(interface):  # CLI-041
     """reset_time far in the future is capped to <= 24 hours from now."""
-    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
-
     far_future = datetime.now() + timedelta(days=7)
     capped = ClaudeCodeInterface._cap_reset_time(far_future)
 
@@ -531,23 +536,18 @@ def test_cap_reset_time_limits_far_future_timestamp(mocker):  # CLI-041
     assert delta < 5, f"Capped time {capped} is not near the 24h cap"
 
 
-def test_cap_reset_time_strips_timezone_info(mocker):  # CLI-042
+def test_cap_reset_time_strips_timezone_info(interface):  # CLI-042
     """_cap_reset_time() returns a naive datetime regardless of input tzinfo."""
-    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
-
     aware_dt = datetime.now(tz=timezone.utc) + timedelta(hours=1)
     result = ClaudeCodeInterface._cap_reset_time(aware_dt)
 
     assert result.tzinfo is None, "Result must be a naive datetime (no tzinfo)"
 
 
-def test_extract_reset_time_caps_far_future_unix_timestamp(mocker):  # CLI-043
+def test_extract_reset_time_caps_far_future_unix_timestamp(interface):  # CLI-043
     """A unix timestamp 7 days away is capped to <= 24h by _extract_reset_time."""
-    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
-    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
-
     far_ts = int((datetime.now() + timedelta(days=7)).timestamp())
-    result = iface._extract_reset_time_from_limit_message(
+    result = interface._extract_reset_time_from_limit_message(
         f"usage limit reached|{far_ts}"
     )
 
@@ -558,12 +558,9 @@ def test_extract_reset_time_caps_far_future_unix_timestamp(mocker):  # CLI-043
     )
 
 
-def test_estimate_reset_time_caps_at_24h(mocker):  # CLI-044
+def test_estimate_reset_time_caps_at_24h(interface):  # CLI-044
     """_estimate_reset_time() result is always <= 24 hours from now."""
-    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
-    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
-
-    result = iface._estimate_reset_time("")
+    result = interface._estimate_reset_time("")
 
     max_allowed = datetime.now() + timedelta(hours=_RATE_LIMIT_MAX_RESET_HOURS)
     assert result <= max_allowed + timedelta(seconds=1), (
@@ -705,10 +702,8 @@ def test_execute_prompt_sets_is_non_retryable_on_nested_session_error(interface)
         "Error: Claude Code cannot be launched inside another Claude Code session.\n"
         "To bypass this check, unset the CLAUDECODE environment variable."
     )
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(
-            returncode=1, stdout="", stderr=nested_session_stderr
-        )
+    mock_proc = make_mock_proc(returncode=1, stdout="", stderr=nested_session_stderr)
+    with patch("subprocess.Popen", return_value=mock_proc):
         result = interface.execute_prompt(QueuedPrompt(content="test"))
     assert result.is_non_retryable is True
     assert result.success is False
@@ -716,10 +711,8 @@ def test_execute_prompt_sets_is_non_retryable_on_nested_session_error(interface)
 
 def test_execute_prompt_is_non_retryable_false_for_ordinary_failure(interface):  # CLI-NR-005
     """ExecutionResult.is_non_retryable is False for retryable subprocess errors."""
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(
-            returncode=1, stdout="", stderr="some random error"
-        )
+    mock_proc = make_mock_proc(returncode=1, stdout="", stderr="some random error")
+    with patch("subprocess.Popen", return_value=mock_proc):
         result = interface.execute_prompt(QueuedPrompt(content="test"))
     assert result.is_non_retryable is False
 
@@ -755,10 +748,10 @@ def test_detect_non_retryable_error_fires_at_last_char_of_scan_window(interface)
 def test_execute_prompt_strips_claudecode_from_env(interface, monkeypatch):  # CLI-ENV-001
     """CLAUDECODE is removed from the subprocess environment."""
     monkeypatch.setenv("CLAUDECODE", "1")
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+    mock_proc = make_mock_proc(returncode=0, stdout="ok", stderr="")
+    with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
         interface.execute_prompt(QueuedPrompt(content="test"))
-    _, kwargs = mock_run.call_args
+    _, kwargs = mock_popen.call_args
     assert "CLAUDECODE" not in kwargs["env"]
 
 
@@ -766,10 +759,10 @@ def test_execute_prompt_preserves_other_env_vars(interface, monkeypatch):  # CLI
     """Other environment variables (e.g. PATH, HOME) are passed through unchanged."""
     monkeypatch.setenv("CLAUDECODE", "1")
     monkeypatch.setenv("MY_CUSTOM_VAR", "hello")
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+    mock_proc = make_mock_proc(returncode=0, stdout="ok", stderr="")
+    with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
         interface.execute_prompt(QueuedPrompt(content="test"))
-    _, kwargs = mock_run.call_args
+    _, kwargs = mock_popen.call_args
     assert "MY_CUSTOM_VAR" in kwargs["env"]
     assert kwargs["env"]["MY_CUSTOM_VAR"] == "hello"
     assert "PATH" in kwargs["env"]
@@ -778,10 +771,10 @@ def test_execute_prompt_preserves_other_env_vars(interface, monkeypatch):  # CLI
 def test_execute_prompt_env_strip_noop_when_claudecode_absent(interface, monkeypatch):  # CLI-ENV-003
     """If CLAUDECODE is not set, the env passed to subprocess is otherwise intact."""
     monkeypatch.delenv("CLAUDECODE", raising=False)
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+    mock_proc = make_mock_proc(returncode=0, stdout="ok", stderr="")
+    with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
         interface.execute_prompt(QueuedPrompt(content="test"))
-    _, kwargs = mock_run.call_args
+    _, kwargs = mock_popen.call_args
     assert "CLAUDECODE" not in kwargs["env"]
     assert "PATH" in kwargs["env"]  # rest of env is intact
 
@@ -791,7 +784,8 @@ def test_verify_claude_available_strips_claudecode_from_env(mocker, monkeypatch)
     monkeypatch.setenv("CLAUDECODE", "1")
     with patch("subprocess.run") as mock_run:
         mock_run.return_value = MagicMock(returncode=0, stdout="2.1.50 (Claude Code)", stderr="")
-        ClaudeCodeInterface(claude_command="claude", timeout=60)
+        iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
+        iface.close()
     _, kwargs = mock_run.call_args
     assert "env" in kwargs
     assert "CLAUDECODE" not in kwargs["env"]
@@ -915,21 +909,18 @@ def test_broad_patterns_not_detected_when_false(interface, broad_phrase):  # CLI
 # ===========================================================================
 
 
-def test_rate_limit_in_stdout_detected_when_returncode_nonzero(mocker):  # CLI-050
+def test_rate_limit_in_stdout_detected_when_returncode_nonzero(interface):  # CLI-050
     """Rate-limit phrase only in stdout is detected when returncode != 0.
 
     Scenario: mid-execution rate-limit causes CLI to emit notice on stdout
     (conversation stream) then exit 1.
     """
-    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
-    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
-
     future_ts = int(datetime.now().timestamp()) + 7200
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(
-            returncode=1, stdout=f"usage limit reached|{future_ts}", stderr=""
-        )
-        result = iface.execute_prompt(QueuedPrompt(content="task"))
+    mock_proc = make_mock_proc(
+        returncode=1, stdout=f"usage limit reached|{future_ts}", stderr=""
+    )
+    with patch("subprocess.Popen", return_value=mock_proc):
+        result = interface.execute_prompt(QueuedPrompt(content="task"))
 
     assert result.rate_limit_info.is_rate_limited is True
     assert result.success is False
@@ -940,25 +931,20 @@ def test_rate_limit_in_stdout_detected_when_returncode_nonzero(mocker):  # CLI-0
     )
 
 
-def test_rate_limit_in_stdout_tail_detected_when_returncode_nonzero(mocker):  # CLI-054
+def test_rate_limit_in_stdout_tail_detected_when_returncode_nonzero(interface):  # CLI-054
     """Rate-limit phrase buried at the end of long stdout is detected when returncode != 0.
 
     Scenario: a long-running conversation (many chars of output) hits a rate limit.
     The rate-limit notice appears at the very end of stdout — past the first
     _RATE_LIMIT_SCAN_CHARS characters. The tail-scan in execute_prompt() must find it.
     """
-    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
-    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
-
     future_ts = int(datetime.now().timestamp()) + 7200
     long_conversation = "x" * (_RATE_LIMIT_SCAN_CHARS * 3)
     stdout_with_tail_notice = long_conversation + f"\nusage limit reached|{future_ts}"
 
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(
-            returncode=1, stdout=stdout_with_tail_notice, stderr=""
-        )
-        result = iface.execute_prompt(QueuedPrompt(content="task"))
+    mock_proc = make_mock_proc(returncode=1, stdout=stdout_with_tail_notice, stderr="")
+    with patch("subprocess.Popen", return_value=mock_proc):
+        result = interface.execute_prompt(QueuedPrompt(content="task"))
 
     assert result.rate_limit_info.is_rate_limited is True, (
         "Rate-limit notice at the tail of long stdout must be detected"
@@ -966,60 +952,49 @@ def test_rate_limit_in_stdout_tail_detected_when_returncode_nonzero(mocker):  # 
     assert result.success is False
 
 
-def test_rate_limit_in_stdout_not_detected_when_returncode_zero(mocker):  # CLI-051
+def test_rate_limit_in_stdout_not_detected_when_returncode_zero(interface):  # CLI-051
     """Rate-limit phrase in stdout is NOT detected when returncode=0.
 
     This is the R3 guard: a successful Claude response that discusses rate
     limits in its text must not be misidentified.
     """
-    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
-    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
-
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(
-            returncode=0,
-            stdout="Here is how to handle rate limit exceeded errors in your code.",
-            stderr=""
-        )
-        result = iface.execute_prompt(QueuedPrompt(content="task"))
+    mock_proc = make_mock_proc(
+        returncode=0,
+        stdout="Here is how to handle rate limit exceeded errors in your code.",
+        stderr=""
+    )
+    with patch("subprocess.Popen", return_value=mock_proc):
+        result = interface.execute_prompt(QueuedPrompt(content="task"))
 
     assert result.rate_limit_info.is_rate_limited is False
     assert result.success is True
 
 
-def test_rate_limit_stderr_takes_priority_over_stdout(mocker):  # CLI-052
+def test_rate_limit_stderr_takes_priority_over_stdout(interface):  # CLI-052
     """When both stderr and stdout contain rate-limit text and returncode != 0,
     the stderr detection wins (stdout scan is not reached when stderr matches).
     """
-    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
-    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
-
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(
-            returncode=1,
-            stdout="usage limit reached|111",
-            stderr="rate limit exceeded"
-        )
-        result = iface.execute_prompt(QueuedPrompt(content="task"))
+    mock_proc = make_mock_proc(
+        returncode=1,
+        stdout="usage limit reached|111",
+        stderr="rate limit exceeded"
+    )
+    with patch("subprocess.Popen", return_value=mock_proc):
+        result = interface.execute_prompt(QueuedPrompt(content="task"))
 
     assert result.rate_limit_info.is_rate_limited is True
 
 
-def test_no_rate_limit_empty_stdout_nonzero_return(mocker):  # CLI-053
+def test_no_rate_limit_empty_stdout_nonzero_return(interface):  # CLI-053
     """Empty stdout with returncode != 0 and no rate-limit text → not rate-limited."""
-    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
-    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
-
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(
-            returncode=1, stdout="", stderr="Something went wrong"
-        )
-        result = iface.execute_prompt(QueuedPrompt(content="task"))
+    mock_proc = make_mock_proc(returncode=1, stdout="", stderr="Something went wrong")
+    with patch("subprocess.Popen", return_value=mock_proc):
+        result = interface.execute_prompt(QueuedPrompt(content="task"))
 
     assert result.rate_limit_info.is_rate_limited is False
 
 
-def test_subprocess_rate_limited_phrase_in_stdout_not_misidentified(mocker):  # CLI-055
+def test_subprocess_rate_limited_phrase_in_stdout_not_misidentified(interface):  # CLI-055
     """Subprocess output containing 'rate limited' in stdout does NOT trigger
     rate-limit detection when returncode != 0.
 
@@ -1028,16 +1003,13 @@ def test_subprocess_rate_limited_phrase_in_stdout_not_misidentified(mocker):  # 
     Without broad_patterns=False in the stdout scan, this would be misidentified
     as a Claude API rate limit, triggering a ~5-hour hold.
     """
-    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
-    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
-
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(
-            returncode=1,
-            stdout="npm ERR! code E429\nnpm ERR! you are rate limited by the npm registry",
-            stderr="",
-        )
-        result = iface.execute_prompt(QueuedPrompt(content="task"))
+    mock_proc = make_mock_proc(
+        returncode=1,
+        stdout="npm ERR! code E429\nnpm ERR! you are rate limited by the npm registry",
+        stderr="",
+    )
+    with patch("subprocess.Popen", return_value=mock_proc):
+        result = interface.execute_prompt(QueuedPrompt(content="task"))
 
     assert result.rate_limit_info.is_rate_limited is False, (
         "Subprocess 'rate limited' phrase in stdout must not trigger Claude API "
@@ -1046,23 +1018,147 @@ def test_subprocess_rate_limited_phrase_in_stdout_not_misidentified(mocker):  # 
     assert result.success is False  # execution did fail, just not from a rate limit
 
 
-def test_rate_limit_error_string_in_user_code_stdout_not_misidentified(mocker):  # CLI-056
+def test_rate_limit_error_string_in_user_code_stdout_not_misidentified(interface):  # CLI-056
     """'rate_limit_error' appearing in Claude-generated code does NOT trigger
     rate-limit detection when returncode != 0 (e.g., a downstream test runner fails).
     """
-    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
-    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
-
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(
-            returncode=1,
-            stdout='if error_type == "rate_limit_error":\n    handle_rate_limit()',
-            stderr="",
-        )
-        result = iface.execute_prompt(QueuedPrompt(content="task"))
+    mock_proc = make_mock_proc(
+        returncode=1,
+        stdout='if error_type == "rate_limit_error":\n    handle_rate_limit()',
+        stderr="",
+    )
+    with patch("subprocess.Popen", return_value=mock_proc):
+        result = interface.execute_prompt(QueuedPrompt(content="task"))
 
     assert result.rate_limit_info.is_rate_limited is False, (
         "'rate_limit_error' in user code echoed to stdout must not trigger "
         "Claude API rate-limit detection"
     )
     assert result.success is False  # process did fail, but not from a rate limit
+
+
+# ===========================================================================
+# Interrupt / Kill Tests (CLI-INT)
+# ===========================================================================
+
+
+def test_kill_current_with_no_running_process(interface):  # CLI-INT-001
+    """kill_current() with no running process does not raise."""
+    interface.kill_current()  # should not raise
+
+
+def test_kill_current_sends_sigterm_and_sets_interrupted(interface):  # CLI-INT-002
+    """kill_current() calls _kill_proc_group(proc, _SIGTERM) and sets _interrupted."""
+    mock_proc = MagicMock()
+    mock_proc.pid = 99999
+    mock_proc.wait.return_value = 0  # leader exits quickly from SIGTERM
+    interface._current_process = mock_proc
+
+    with patch.object(ClaudeCodeInterface, "_kill_proc_group", return_value=True) as mock_kpg:
+        interface.kill_current()
+
+    mock_kpg.assert_any_call(mock_proc, _SIGTERM)
+    assert interface._interrupted is True
+    assert interface._escalate_thread is not None
+
+
+def test_kill_current_escalates_to_sigkill_on_timeout(interface):  # CLI-INT-003
+    """kill_current() escalates to SIGKILL when p.wait() times out."""
+    escalated = threading.Event()
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 99999
+    mock_proc.wait.side_effect = subprocess.TimeoutExpired(cmd=["claude"], timeout=3)
+
+    call_log = []
+
+    def mock_kill_proc_group(proc, sig):
+        call_log.append(sig)
+        if sig == _SIGKILL:
+            escalated.set()
+        return True
+
+    interface._current_process = mock_proc
+
+    with patch.object(ClaudeCodeInterface, "_kill_proc_group", side_effect=mock_kill_proc_group):
+        interface.kill_current()
+
+    assert escalated.wait(timeout=2), "Escalation thread did not fire SIGKILL within 2 s"
+    interface._escalate_thread.join(timeout=1)
+    assert not interface._escalate_thread.is_alive()
+    assert call_log == [_SIGTERM, _SIGKILL], f"Expected SIGTERM then SIGKILL, got {call_log}"
+
+
+def test_kill_current_returns_early_when_process_already_gone(interface):  # CLI-INT-004
+    """kill_current() returns early when _kill_proc_group returns False."""
+    mock_proc = MagicMock()
+    mock_proc.pid = 99999
+    interface._current_process = mock_proc
+
+    with patch.object(ClaudeCodeInterface, "_kill_proc_group", return_value=False):
+        interface.kill_current()
+
+    assert interface._interrupted is False
+    assert interface._escalate_thread is None
+
+
+def test_execute_prompt_raises_keyboard_interrupt_when_interrupted(interface):  # CLI-INT-005
+    """execute_prompt() raises KeyboardInterrupt when _interrupted is True."""
+    def mock_communicate(timeout=None):
+        interface._interrupted = True  # simulates kill_current() firing during communicate()
+        return ("output", "")
+
+    mock_proc = make_mock_proc()
+    mock_proc.communicate.side_effect = mock_communicate
+
+    with patch("subprocess.Popen", return_value=mock_proc):
+        with pytest.raises(KeyboardInterrupt):
+            interface.execute_prompt(QueuedPrompt(content="task"))
+
+    assert interface._interrupted is False  # cleared in finally
+
+
+def test_timeout_clears_interrupted_flag(interface):  # CLI-INT-006
+    """When TimeoutExpired is raised, _interrupted is False afterward."""
+    def mock_kill_proc_group(proc, sig):
+        if sig == _SIGKILL:
+            interface._interrupted = True  # simulates kill_current() during timeout teardown
+
+    mock_proc = make_mock_proc()
+    mock_proc.pid = 99999
+    mock_proc.communicate.side_effect = subprocess.TimeoutExpired(cmd=["claude"], timeout=10)
+
+    with patch("subprocess.Popen", return_value=mock_proc), \
+         patch.object(ClaudeCodeInterface, "_kill_proc_group", side_effect=mock_kill_proc_group):
+        result = interface.execute_prompt(QueuedPrompt(content="task"))
+
+    assert result.success is False
+    assert "timed out" in result.error
+    assert interface._interrupted is False  # cleared in finally despite being True mid-timeout
+
+
+def test_close_is_idempotent(interface):  # CLI-INT-007
+    """close() is safe to call multiple times."""
+    interface.close()
+    interface.close()  # should not raise
+
+
+def test_atexit_cleanup_survives_exceptions(interface):  # CLI-INT-008
+    """_atexit_cleanup() does not raise even when kill_current() raises."""
+    interface.kill_current = MagicMock(side_effect=AttributeError("os is None"))
+    interface._atexit_cleanup()  # should not raise
+
+
+def test_base_exception_cleanup_kills_subprocess(interface):  # CLI-INT-009
+    """except BaseException cleanup kills the subprocess on KeyboardInterrupt."""
+    mock_proc = make_mock_proc()
+    mock_proc.communicate.side_effect = KeyboardInterrupt
+
+    with patch("subprocess.Popen", return_value=mock_proc), \
+         patch.object(ClaudeCodeInterface, "_kill_proc_group") as mock_kpg:
+        with pytest.raises(KeyboardInterrupt):
+            interface.execute_prompt(QueuedPrompt(content="task"))
+
+    mock_kpg.assert_called_once_with(mock_proc, _SIGKILL)
+    assert interface._current_process is None
+    assert interface._interrupted is False
