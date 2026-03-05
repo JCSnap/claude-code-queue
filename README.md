@@ -7,7 +7,7 @@ A tool to queue Claude Code prompts and automatically execute them when token li
 -   **Markdown-based Queue**: Each prompt is a `.md` file with YAML frontmatter
 -   **Automatic Rate Limit Handling**: Detects rate limits and waits for reset windows
 -   **Priority System**: Execute high-priority prompts first
--   **Retry Logic**: Automatically retry failed prompts
+-   **Retry Logic**: Automatically retry failed and rate-limited prompts; both share the `max_retries` total-attempts counter
 -   **Persistent Storage**: Queue survives system restarts
 -   **Prompt Bank**: Save and reuse templates for recurring tasks
 -   **Interactive Prompt Box**: Browse and select files interactively with fuzzy search
@@ -19,7 +19,29 @@ A tool to queue Claude Code prompts and automatically execute them when token li
 pip install claude-code-queue
 ```
 
-**Note**: The interactive prompt box is built with Rust. If installing from source (not from PyPI), you'll need the [Rust toolchain](https://rustup.rs/) installed.
+**Note**: The interactive `prompt-box` feature is compiled from Rust source at install
+time. If the [Rust toolchain](https://rustup.rs/) is not present when running
+`pip install`, the rest of `claude-code-queue` installs and works normally — only
+`claude-queue prompt-box` will be unavailable. To enable it later, install Rust and
+run `pip install --force-reinstall claude-code-queue`.
+
+**Linux only**: building `prompt-box` also requires X11 development headers
+(`libxcb-dev` on Debian/Ubuntu, `libxcb-devel` on Fedora/RHEL, `libxcb` on Arch).
+At runtime, clipboard support requires `xclip` or `xsel` to be installed.
+
+### Claude Code Skill (optional)
+
+If you use [Claude Code](https://claude.ai/code), install the bundled `/queue`
+skill so Claude can help you construct and manage queue tasks:
+
+```bash
+claude-queue install-skill
+```
+
+This copies a `SKILL.md` to `~/.claude/skills/queue/`. After restarting Claude
+Code, type `/queue` to invoke it directly, and Claude will also proactively
+suggest queuing when a task is complex or likely to hit rate limits. Use
+`--force` to update an existing installation after upgrading the package.
 
 Or, for local development:
 
@@ -254,14 +276,15 @@ The prompt box is built with Rust for fast file indexing and responsive UI, maki
 
 1. **Queue Processing**: Runs prompts in priority order (lower number = higher priority)
 2. **Rate Limit Detection**: Monitors Claude Code output for rate limit messages
-3. **Automatic Waiting**: When rate limited, waits for the next 5-hour window
-4. **Retry Logic**: Failed prompts are retried up to `max_retries` times
+3. **Automatic Waiting**: When rate limited, parses the actual reset time from Claude's output when available; falls back to estimating the next 5-hour window boundary otherwise
+4. **Retry Logic**: Failed prompts are retried up to `max_retries` total attempts. Interrupted prompts (from crashes or ungraceful shutdowns) are automatically re-queued on the next startup — **at-least-once semantics apply**: a task that finished but whose result was not saved before a crash will run again. Design tasks to be idempotent where possible.
 5. **File Organization**:
     - `~/.claude-queue/queue/` - Pending prompts
     - `~/.claude-queue/completed/` - Successful executions
     - `~/.claude-queue/failed/` - Failed prompts
     - `~/.claude-queue/bank/` - Saved template library
     - `~/.claude-queue/queue-state.json` - Queue metadata
+6. **Execution Logs**: After each execution attempt, a log is appended to the prompt's `.md` file for human inspection. The log is automatically stripped before the prompt is sent to Claude, so Claude always receives only the original prompt text regardless of how many times the task has been retried.
 
 ## Configuration
 
@@ -289,10 +312,12 @@ working_directory: /path/to/project # Where to run the prompt
 context_files: # Files to include as context
     - src/main.py
     - README.md
-max_retries: 3 # Maximum retry attempts
+max_retries: 3 # Maximum total execution attempts (1 = no retries, -1 = unlimited)
 estimated_tokens: 1000 # Estimated token usage (optional)
 ---
 ```
+
+**`max_retries` semantics:** this field controls the total number of execution attempts, not the number of retries after the first failure. `max_retries: 3` means 3 total attempts (initial + 2 retries); `max_retries: 1` means a single attempt with no retries; `max_retries: -1` means unlimited retries. Rate-limited executions and failure retries share the same counter.
 
 ## Examples
 
@@ -366,8 +391,10 @@ The system automatically detects Claude Code rate limits by monitoring:
 When rate limited:
 
 1. Prompt status changes to `rate_limited`
-2. Naively loop every fixed interval until rate limit is lifted (there's probably a way smarter way to find the end time of rate limit window， open to contributions)
-3. Once the rate limit is lifted, continue processing the requests
+2. The queue determines the reset time using a two-tier strategy:
+    - **Parsed reset time**: extracts the actual reset time from Claude's output when available
+    - **Estimated reset time**: falls back to estimating the next 5-hour window boundary (00:00–05:00, 05:00–10:00, 10:00–15:00, 15:00–20:00, 20:00–01:00) based on the current time
+3. Once the reset time is reached, the prompt is re-queued and execution resumes
 
 ## Troubleshooting
 
@@ -383,9 +410,13 @@ claude-queue status --detailed
 
 **Prompts stuck in executing state:**
 
--   Stop queue processor (Ctrl+C)
--   Restart with `claude-queue start`
--   Executing prompts will reset to queued status
+Interrupted prompts are **automatically re-queued** on the next startup — no manual intervention is needed. Simply restart the queue:
+
+```bash
+claude-queue start
+```
+
+> **Warning — at-least-once execution:** If the daemon was killed after Claude finished but before the result was saved to disk, the task will run again on restart. Design tasks to be idempotent (safe to run more than once) where possible.
 
 **Rate limit not detected:**
 

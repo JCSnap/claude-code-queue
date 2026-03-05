@@ -38,6 +38,7 @@ class QueuedPrompt:
     last_executed: Optional[datetime] = None
     rate_limited_at: Optional[datetime] = None
     reset_time: Optional[datetime] = None
+    retry_not_before: Optional[datetime] = None  # Fix 3: earliest time for next generic retry
 
     def add_log(self, message: str) -> None:
         """Add a log entry with timestamp."""
@@ -45,21 +46,48 @@ class QueuedPrompt:
         self.execution_log += f"[{timestamp}] {message}\n"
 
     def can_retry(self) -> bool:
-        """Check if this prompt can be retried."""
-        return self.retry_count < self.max_retries and self.status in [
-            PromptStatus.FAILED,
-            PromptStatus.RATE_LIMITED,
-        ]
+        # Called by _process_execution_result() while status is still EXECUTING.
+        # The old status allowlist (FAILED, RATE_LIMITED) always returned False during
+        # execution — that was the C1 bug. A plain retry_count < max_retries
+        # replacement would make COMPLETED/CANCELLED prompts report can_retry() is True.
+        # The terminal blocklist prevents both failure modes and must not be reverted
+        # to a naive counter check.
+        terminal = (PromptStatus.COMPLETED, PromptStatus.CANCELLED)
+        if self.status in terminal:
+            return False
+        has_retries = self.max_retries == -1 or self.retry_count < self.max_retries
+        return has_retries
 
-    def should_execute_now(self) -> bool:
-        """Check if this prompt should be executed now (not rate limited)."""
-        if self.status != PromptStatus.RATE_LIMITED:
-            return True
+    def clear_retry_backoff(self) -> None:
+        """Clear the generic-failure retry backoff.
 
-        if self.reset_time and datetime.now() >= self.reset_time:
-            return True
+        INVARIANT: must be called on every status transition except the
+        generic-failure retry path in _process_execution_result(), which is the
+        only place that SETS retry_not_before. Centralising the clear in a named
+        method makes grep easy and documents the single exception.
+        """
+        self.retry_not_before = None
 
-        return False
+    def should_execute_now(self, now: Optional[datetime] = None) -> bool:
+        """Check if this prompt should be executed now (not rate limited or in cooldown).
+
+        Called by get_next_prompt() for QUEUED and RATE_LIMITED prompts only.
+
+        Args:
+            now: current time, passed by get_next_prompt() so all prompts in a
+                 single selection pass are evaluated against the same timestamp.
+                 Falls back to datetime.now() for standalone calls.
+        """
+        if now is None:
+            now = datetime.now()
+        if self.status == PromptStatus.RATE_LIMITED:
+            if self.reset_time and now >= self.reset_time:
+                return True
+            return False
+        # Fix 3: honour per-prompt generic-failure cooldown for QUEUED prompts.
+        if self.retry_not_before is not None and now < self.retry_not_before:
+            return False
+        return True
 
 
 @dataclass
@@ -70,10 +98,19 @@ class RateLimitInfo:
     reset_time: Optional[datetime] = None
     limit_message: str = ""
     timestamp: Optional[datetime] = None
+    detection_source: str = "stderr"  # "stderr" (default) or "stdout"; set by execute_prompt()
 
     @classmethod
     def from_claude_response(cls, response_text: str) -> "RateLimitInfo":
-        """Parse rate limit info from Claude Code response."""
+        """Parse rate limit info from Claude Code response.
+
+        LEGACY / TEST-ONLY PATH — this method is not called by the production
+        execution path (ClaudeCodeInterface._detect_rate_limit() handles that).
+        Its pattern list intentionally diverges from _detect_rate_limit(): it
+        still includes the broad "limit exceeded" phrase (removed from production
+        code in S11a) and does not include the Fix 1 additions. Do not use this
+        method for new production code; update _detect_rate_limit() instead.
+        """
         # Common rate limit indicators in Claude Code responses
         rate_limit_indicators = [
             "usage limit reached",
@@ -110,10 +147,11 @@ class QueueState:
 
     def get_next_prompt(self) -> Optional[QueuedPrompt]:
         """Get the next prompt to execute (highest priority, can execute now)."""
+        now = datetime.now()
         executable_prompts = [
             p
             for p in self.prompts
-            if p.status == PromptStatus.QUEUED and p.should_execute_now()
+            if p.status == PromptStatus.QUEUED and p.should_execute_now(now)
         ]
 
         if not executable_prompts:
@@ -122,13 +160,16 @@ class QueueState:
                 p
                 for p in self.prompts
                 if p.status == PromptStatus.RATE_LIMITED
-                and p.should_execute_now()
+                and p.should_execute_now(now)
                 and p.can_retry()
             ]
             if retry_prompts:
                 # Reset status for retry
                 prompt = min(retry_prompts, key=lambda p: p.priority)
                 prompt.status = PromptStatus.QUEUED
+                prompt.clear_retry_backoff()    # Fix 3: mirror _check_rate_limited_prompts(); clear so
+                                                 # should_execute_now() returns True immediately after
+                                                 # the RATE_LIMITED→QUEUED transition.
                 return prompt
 
             return None
@@ -202,6 +243,7 @@ class ExecutionResult:
     error: str = ""
     rate_limit_info: Optional[RateLimitInfo] = None
     execution_time: float = 0.0
+    is_non_retryable: bool = False  # True if the error is permanent regardless of retry count
 
     @property
     def is_rate_limited(self) -> bool:
