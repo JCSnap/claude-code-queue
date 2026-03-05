@@ -148,6 +148,16 @@ class QueueState:
     def get_next_prompt(self) -> Optional[QueuedPrompt]:
         """Get the next prompt to execute (highest priority, can execute now)."""
         now = datetime.now()
+
+        # If any prompt is actively rate-limited (reset window not yet reached),
+        # don't start new work — we're already known to be rate-limited and firing
+        # more requests would just pile up additional rate-limit hits.
+        if any(
+            p.status == PromptStatus.RATE_LIMITED and not p.should_execute_now(now)
+            for p in self.prompts
+        ):
+            return None
+
         executable_prompts = [
             p
             for p in self.prompts
