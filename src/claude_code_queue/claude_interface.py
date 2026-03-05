@@ -95,7 +95,8 @@ class ClaudeCodeInterface:
                         f"Warning: claude {version_str!r} predates stderr-only rate-limit "
                         f"detection (threshold "
                         f"{'.'.join(str(x) for x in _STDERR_RATE_LIMIT_MIN_VERSION)}). "
-                        "Rate-limit messages written to stdout will be missed.",
+                        "On successful executions (returncode=0), rate-limit messages on "
+                        "stdout will be missed. Non-zero exits are covered by the stdout scan.",
                         file=sys.stderr,
                     )
 
@@ -174,9 +175,39 @@ class ClaudeCodeInterface:
             # Searching stdout causes false positives if Claude's response happens to
             # contain any trigger phrase (e.g., code that handles rate limits).
             # Caveat: if older versions of the `claude` CLI write rate-limit messages to
-            # stdout, this change will miss them (see _STDERR_RATE_LIMIT_MIN_VERSION).
+            # stdout on successful executions (returncode=0), this will miss them
+            # (see _STDERR_RATE_LIMIT_MIN_VERSION). For returncode != 0 exits, stdout
+            # is also scanned by the Fix 2 block below.
             rate_limit_info = self._detect_rate_limit(result.stderr)
             is_non_retryable = self._detect_non_retryable_error(result.stderr)
+
+            # Fix 2 — Mid-execution rate-limit: when the process exits non-zero and
+            # stderr has no rate-limit pattern, also scan stdout.
+            # Rationale: a usage-limit hit during an active conversation causes the CLI
+            # to emit the notice on stdout (conversation stream) then exit non-zero.
+            # Scanning stdout is safe here because returncode != 0 is incompatible with
+            # a genuine successful Claude response, so no false positive can occur.
+            #
+            # IMPORTANT: scan the TAIL, not the head.
+            # _detect_rate_limit() internally applies output[:_RATE_LIMIT_SCAN_CHARS].
+            # For a long-running conversation (e.g. 62s), stdout begins with thousands
+            # of characters of conversation output; the rate-limit notice appears at the
+            # very end of the stream. Passing the tail ensures the scan window covers
+            # the error, not the start of the conversation.
+            if result.returncode != 0 and not rate_limit_info.is_rate_limited and result.stdout:
+                # broad_patterns=False: only stdout-safe patterns are used here.
+                # Unlike stderr (where genuine Claude CLI messages appear at the very
+                # start and the scan-window guards depth), the stdout tail can contain
+                # subprocess output that legitimately includes broad phrases like
+                # "rate limited", "too many requests", "quota exceeded",
+                # "rate_limit_error" (in user code), or "rate limit exceeded".
+                # Allowing them would turn a subprocess failure into a
+                # false-positive ~5-hour rate-limit hold.
+                stdout_tail = result.stdout[-_RATE_LIMIT_SCAN_CHARS:]
+                stdout_rate_limit_info = self._detect_rate_limit(stdout_tail, broad_patterns=False)
+                if stdout_rate_limit_info.is_rate_limited:
+                    stdout_rate_limit_info.detection_source = "stdout"
+                    rate_limit_info = stdout_rate_limit_info
 
             success = result.returncode == 0 and not rate_limit_info.is_rate_limited
 
@@ -206,7 +237,11 @@ class ClaudeCodeInterface:
                 execution_time=execution_time,
             )
 
-    def _detect_rate_limit(self, output: str) -> RateLimitInfo:
+    def _detect_rate_limit(
+        self,
+        output: str,
+        broad_patterns: bool = True,  # True for stderr (common path); False for stdout scanning (Fix 2)
+    ) -> RateLimitInfo:
         """Detect rate limiting from Claude Code output."""
         # S11b: restrict pattern scan to the first _RATE_LIMIT_SCAN_CHARS characters.
         # Genuine rate-limit messages from the Claude CLI are short and always appear
@@ -216,16 +251,37 @@ class ClaudeCodeInterface:
         scan_window = output[:_RATE_LIMIT_SCAN_CHARS].lower()
 
         # S11a: 'limit exceeded' removed — too broad (matches Python tracebacks, shell
-        # ulimit errors, compiler output, etc.). Every meaningful Claude CLI rate-limit
-        # scenario is covered by the remaining four patterns.
-        # ASSUMPTION: the Claude CLI never uses bare "api limit exceeded" without a
-        # "rate", "quota", or "usage" qualifier. Re-verify if CLI output format changes.
+        # ulimit errors, compiler output, etc.). Re-verify if CLI output format changes.
+        # Fix 1: patterns split into stdout-safe and broad tiers. Stdout-safe patterns
+        # are specific to Anthropic messaging ("your" or pipe-delimited timestamp format);
+        # broad patterns are safe for stderr but risk false positives in stdout.
+        #
+        # Stdout-safe patterns — listed timestamp-extractor-first so that the richer
+        # _extract_reset_time_from_limit_message() fires before _estimate_reset_time()
+        # for any pattern that could theoretically match the same input.
         rate_limit_patterns = [
-            ("usage limit reached", self._extract_reset_time_from_limit_message),
-            ("rate limit exceeded", self._estimate_reset_time),
-            ("too many requests", self._estimate_reset_time),
-            ("quota exceeded", self._estimate_reset_time),
+            ("usage limit reached", self._extract_reset_time_from_limit_message),  # "usage limit reached|<ts>"
+            ("exceeded your rate limit", self._estimate_reset_time),  # "you have exceeded your rate limit"
+            ("reached your usage limit", self._estimate_reset_time),   # "you've/have reached your usage limit" (no apostrophe to avoid U+2019 mismatch)
         ]
+        # Broad patterns — safe for stderr (genuine Claude CLI messages appear at the
+        # very start; the scan-window provides depth protection) but NOT safe for
+        # stdout scanning, where subprocess output (npm, pip, curl, etc.) can
+        # legitimately contain these phrases, causing a false-positive ~5-hour hold.
+        #
+        # "rate limit exceeded" — HTTP 429 standard text; third-party APIs use it.
+        # "rate_limit_error" — Anthropic API type, but appears in user-generated code.
+        # "too many requests" — HTTP 429 status text; npm/pip/cloud CLIs print it.
+        # "quota exceeded" — GCP/AWS/Azure quota error messages use it.
+        # "rate limited" — common English phrase in network library output.
+        if broad_patterns:
+            rate_limit_patterns.extend([
+                ("rate limit exceeded", self._estimate_reset_time),
+                ("rate_limit_error", self._estimate_reset_time),       # Anthropic API machine-readable type
+                ("too many requests", self._estimate_reset_time),
+                ("quota exceeded", self._estimate_reset_time),
+                ("rate limited", self._estimate_reset_time),           # "you are rate limited"
+            ])
 
         for pattern, reset_extractor in rate_limit_patterns:
             if pattern in scan_window:

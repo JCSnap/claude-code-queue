@@ -863,3 +863,43 @@ def test_bank_list_returns_full_metadata(tmp_path):  # STO-064
     assert t["estimated_tokens"] is None
     assert "modified" in t and t["modified"] is not None
     assert "title" in t and len(t["title"]) > 0
+
+
+# ===========================================================================
+# _parse_optional_datetime() Fast-Paths (STO-040..042)
+# ===========================================================================
+
+
+def test_parse_optional_datetime_native_datetime_object():  # STO-040
+    """PyYAML returns a native datetime when the YAML value matches the
+    timestamp pattern (e.g. an unquoted isoformat). _parse_optional_datetime()
+    must handle this instead of passing it to fromisoformat() (which requires
+    a str and raises TypeError, silently swallowed by the except clause).
+    """
+    from datetime import datetime as dt
+    native_dt = dt(2025, 6, 1, 15, 0, 0)
+    result = QueueStorage._parse_optional_datetime(native_dt)
+    assert result == native_dt
+    assert result.tzinfo is None
+
+
+def test_parse_optional_datetime_aware_datetime_stripped():  # STO-041
+    """A timezone-aware datetime from PyYAML must have tzinfo stripped
+    (the codebase uses naive datetimes throughout).
+    """
+    from datetime import datetime as dt, timezone
+    aware_dt = dt(2025, 6, 1, 15, 0, 0, tzinfo=timezone.utc)
+    result = QueueStorage._parse_optional_datetime(aware_dt)
+    assert result == dt(2025, 6, 1, 15, 0, 0)
+    assert result.tzinfo is None
+
+
+def test_parse_optional_datetime_date_object():  # STO-042
+    """PyYAML returns a datetime.date (not datetime) for date-only YAML values
+    like `retry_not_before: 2025-06-01` (no time component).
+    _parse_optional_datetime() must convert it to a datetime at midnight.
+    """
+    from datetime import date, datetime as dt
+    result = QueueStorage._parse_optional_datetime(date(2025, 6, 1))
+    assert result == dt(2025, 6, 1, 0, 0, 0)
+    assert result.tzinfo is None
