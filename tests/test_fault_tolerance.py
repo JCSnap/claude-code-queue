@@ -23,6 +23,7 @@ import builtins
 import errno
 import os
 import subprocess
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -172,6 +173,7 @@ def mgr(tmp_path, mock_iface):
     m.check_interval = 30
     m.running = False
     m.state = None
+    m._generic_failure_retry_delay = 60  # Fix 3: __new__ bypasses __init__
     return m
 
 
@@ -1149,6 +1151,12 @@ def test_repeated_subprocess_kills_exhaust_retries_and_fail(mgr, mock_iface):  #
     for _ in range(3):
         mgr.state = None
         mgr._process_queue_iteration()
+        # Fix 3: simulate passage of time past retry_not_before.
+        if mgr.state:
+            for pr in mgr.state.prompts:
+                if pr.retry_not_before is not None:
+                    pr.retry_not_before = datetime.now() - timedelta(seconds=1)
+            mgr.storage.save_queue_state(mgr.state)
 
     assert mgr.state.prompts[0].status == PromptStatus.FAILED
     assert mgr.state.prompts[0].retry_count == 3
@@ -1194,6 +1202,7 @@ class TestSIGKILLRecovery:
         m.check_interval = 30
         m.running = True
         m.state = None
+        m._generic_failure_retry_delay = 60  # Fix 3: __new__ bypasses __init__
         return m
 
     def test_orphaned_executing_file_present_after_sigkill_simulation(self, storage):  # FT-057
@@ -1473,6 +1482,7 @@ def test_startup_connection_failure_prevents_queue_loop(tmp_path):  # FT-070
     manager.check_interval = 30
     manager.running = False
     manager.state = None
+    manager._generic_failure_retry_delay = 60  # Fix 3: __new__ bypasses __init__
 
     manager.start()
 
@@ -1525,6 +1535,12 @@ def test_repeated_network_failures_exhaust_retries(mgr, mock_iface):  # FT-073
     for _ in range(3):
         mgr.state = None
         mgr._process_queue_iteration()
+        # Fix 3: simulate passage of time past retry_not_before.
+        if mgr.state:
+            for pr in mgr.state.prompts:
+                if pr.retry_not_before is not None:
+                    pr.retry_not_before = datetime.now() - timedelta(seconds=1)
+            mgr.storage.save_queue_state(mgr.state)
 
     assert mgr.state.prompts[0].status == PromptStatus.FAILED
     assert mgr.state.failed_count == 1
@@ -1547,6 +1563,12 @@ def test_network_restored_prompt_succeeds_on_retry(mgr, mock_iface):  # FT-074
     mgr.state = None
     mgr._process_queue_iteration()
     assert mgr.state.prompts[0].status == PromptStatus.QUEUED
+
+    # Fix 3: simulate passage of time past retry_not_before.
+    for pr in mgr.state.prompts:
+        if pr.retry_not_before is not None:
+            pr.retry_not_before = datetime.now() - timedelta(seconds=1)
+    mgr.storage.save_queue_state(mgr.state)
 
     mgr.state = None
     mgr._process_queue_iteration()
@@ -1637,6 +1659,7 @@ def test_startup_auth_failure_prevents_start(tmp_path):  # FT-079
     manager.check_interval = 30
     manager.running = False
     manager.state = None
+    manager._generic_failure_retry_delay = 60  # Fix 3: __new__ bypasses __init__
 
     manager.start()
 
@@ -1681,6 +1704,12 @@ def test_wrong_credentials_exhaust_retries_marks_failed(mgr, mock_iface):  # FT-
     for _ in range(3):
         mgr.state = None
         mgr._process_queue_iteration()
+        # Fix 3: simulate passage of time past retry_not_before.
+        if mgr.state:
+            for pr in mgr.state.prompts:
+                if pr.retry_not_before is not None:
+                    pr.retry_not_before = datetime.now() - timedelta(seconds=1)
+            mgr.storage.save_queue_state(mgr.state)
 
     assert mgr.state.prompts[0].status == PromptStatus.FAILED
     assert mgr.state.failed_count == 1
@@ -1792,6 +1821,7 @@ def test_network_loss_then_sigkill_then_restart_full_recovery(tmp_path, mock_ifa
     mgr1.check_interval = 30
     mgr1.running = False
     mgr1.state = None
+    mgr1._generic_failure_retry_delay = 60  # Fix 3: __new__ bypasses __init__
 
     prompt = QueuedPrompt(
         id="t42aaaa", content="fetch data", max_retries=3, retry_count=0
@@ -1838,6 +1868,7 @@ def test_network_loss_then_sigkill_then_restart_full_recovery(tmp_path, mock_ifa
     mgr2.check_interval = 30
     mgr2.running = False
     mgr2.state = None
+    mgr2._generic_failure_retry_delay = 60  # Fix 3: __new__ bypasses __init__
 
     mgr2._process_queue_iteration()
 
@@ -1890,3 +1921,93 @@ def test_nested_session_error_not_picked_up_again(tmp_path, mocker):  # FT-087
 
     # execute_prompt must have been called exactly once
     assert execute_mock.call_count == 1
+
+
+# ===========================================================================
+# Fix 3 — Retry Backoff (FT-088..091)
+# ===========================================================================
+
+
+def test_use_bank_template_clears_retry_not_before(tmp_path):  # FT-088
+    """use_bank_template() must clear retry_not_before so newly-queued prompts
+    from templates are immediately eligible for execution.
+    """
+    storage = QueueStorage(str(tmp_path))
+    future_dt = (datetime.now() + timedelta(hours=1)).isoformat()
+    bank_file = storage.bank_dir / "my-template.md"
+    bank_file.write_text(
+        f"---\npriority: 0\nworking_directory: .\nmax_retries: 3\n"
+        f"retry_count: 0\ncreated_at: '2025-01-01T00:00:00'\n"
+        f"retry_not_before: '{future_dt}'\n---\n\ntask content"
+    )
+    prompt = storage.use_bank_template("my-template")
+    assert prompt is not None
+    assert prompt.retry_not_before is None, (
+        "use_bank_template() must clear retry_not_before from bank template frontmatter"
+    )
+
+
+def test_retry_not_before_survives_reload(tmp_path):  # FT-089
+    """retry_not_before must be preserved across a save+load cycle."""
+    storage = QueueStorage(str(tmp_path))
+    future = datetime.now() + timedelta(minutes=5)
+    p = QueuedPrompt(id="rrr12345", content="cooldown task", retry_not_before=future)
+    state = QueueState()
+    state.add_prompt(p)
+    storage.save_queue_state(state)
+
+    reloaded = storage.load_queue_state()
+    recovered = next(pr for pr in reloaded.prompts if pr.id == p.id)
+    assert recovered.retry_not_before is not None
+    assert recovered.retry_not_before > datetime.now()
+
+
+def test_generic_failure_unlimited_retries_respects_backoff(tmp_path, mocker):  # FT-090
+    """With max_retries=-1, each failure sets retry_not_before so the prompt
+    cannot be selected again until the delay expires.
+    Two iteration calls without clearing retry_not_before → execute_prompt
+    called exactly once.
+    """
+    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
+    mgr = QueueManager(storage_dir=str(tmp_path), generic_failure_retry_delay=3600)
+
+    p = QueuedPrompt(id="spin01", content="always fails", max_retries=-1)
+    mgr.state = mgr.storage.load_queue_state()
+    mgr.state.add_prompt(p)
+    mgr.storage.save_queue_state(mgr.state)
+
+    execute_mock = mocker.patch.object(
+        mgr.claude_interface,
+        "execute_prompt",
+        return_value=ExecutionResult(
+            success=False, output="", error="persistent error", execution_time=2.0
+        )
+    )
+
+    mgr._process_queue_iteration()  # executes, sets retry_not_before
+    mgr.state = None
+    mgr._process_queue_iteration()  # retry_not_before in future — skipped
+
+    assert execute_mock.call_count == 1
+
+
+def test_crash_recovery_clears_retry_not_before(tmp_path):  # FT-091
+    """After a crash, .executing.md files are recovered to QUEUED status.
+    retry_not_before must be cleared in the recovery path so the prompt is
+    immediately eligible for re-execution.
+    """
+    storage = QueueStorage(str(tmp_path))
+    future = datetime.now() + timedelta(hours=1)
+    p = QueuedPrompt(id="crash01", content="crashed task", max_retries=3)
+    p.retry_not_before = future
+    p.status = PromptStatus.EXECUTING
+    base = MarkdownPromptParser.get_base_filename(p).replace(".md", ".executing.md")
+    exec_path = storage.queue_dir / base
+    storage.parser.write_prompt_file(p, exec_path)
+
+    reloaded = storage.load_queue_state()
+    recovered = next(pr for pr in reloaded.prompts if pr.id == p.id)
+    assert recovered.status == PromptStatus.QUEUED
+    assert recovered.retry_not_before is None, (
+        "Crash recovery must clear retry_not_before so the prompt is immediately eligible"
+    )

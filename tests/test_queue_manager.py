@@ -6,7 +6,7 @@ The manager fixture uses tmp_path so every test gets a fresh storage dir.
 """
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
 
@@ -236,7 +236,11 @@ def test_priority_order_respected(manager):  # QMG-009
 
 
 def test_failed_prompt_retried_up_to_max_retries(manager):  # QMG-010
-    """A prompt that always fails is retried up to max_retries times then FAILED."""
+    """A prompt that always fails is retried up to max_retries times then FAILED.
+
+    After Fix 3, each failure sets retry_not_before into the future. We clear
+    it between iterations to simulate the passage of time.
+    """
     fail = _fail_result("build failed")
     state = manager.storage.load_queue_state()
     p = QueuedPrompt(content="failing task", max_retries=2)
@@ -247,6 +251,12 @@ def test_failed_prompt_retried_up_to_max_retries(manager):  # QMG-010
         for _ in range(5):
             manager.state = None
             manager._process_queue_iteration()
+            # Simulate passage of time past retry_not_before.
+            if manager.state:
+                for pr in manager.state.prompts:
+                    if pr.retry_not_before is not None:
+                        pr.retry_not_before = datetime.now() - timedelta(seconds=1)
+                manager.storage.save_queue_state(manager.state)
 
     failed_files = list(manager.storage.failed_dir.glob("*.md"))
     assert len(failed_files) == 1, (
@@ -568,3 +578,145 @@ def test_ordinary_failure_still_retries(manager, mocker):  # QMG-NR-004
 
     assert prompt.status == PromptStatus.QUEUED  # retried, not failed
     assert prompt.retry_count == 1
+
+
+# ===========================================================================
+# Fix 3 — Retry Backoff for Generic Failures
+# ===========================================================================
+
+
+def test_generic_failure_sets_retry_not_before(manager):  # QMG-025
+    """After a generic (non-rate-limited) failure with retries remaining,
+    prompt.retry_not_before is set to a future datetime.
+    """
+    fail = _fail_result("transient error")
+    state = manager.storage.load_queue_state()
+    p = QueuedPrompt(content="retry me", max_retries=3, retry_count=0)
+    state.add_prompt(p)
+    manager.storage.save_queue_state(state)
+    manager.state = None
+
+    with patch.object(manager.claude_interface, "execute_prompt", return_value=fail):
+        manager._process_queue_iteration()
+
+    updated = next(pr for pr in manager.state.prompts if pr.id == p.id)
+    assert updated.retry_not_before is not None
+    assert updated.retry_not_before > datetime.now()
+
+
+def test_prompt_with_future_retry_not_before_is_skipped(manager):  # QMG-026
+    """A QUEUED prompt whose retry_not_before is in the future must not be
+    selected for execution.
+    """
+    state = manager.storage.load_queue_state()
+    p = QueuedPrompt(content="not yet", max_retries=3, retry_count=1)
+    p.retry_not_before = datetime.now() + timedelta(minutes=5)
+    state.add_prompt(p)
+    manager.storage.save_queue_state(state)
+    manager.state = None
+
+    with patch.object(manager.claude_interface, "execute_prompt") as mock_exec:
+        did_work = manager._process_queue_iteration()
+
+    assert did_work is False
+    mock_exec.assert_not_called()
+
+
+def test_prompt_with_past_retry_not_before_is_eligible(manager):  # QMG-027
+    """A QUEUED prompt whose retry_not_before is in the past must be eligible
+    for execution.
+    """
+    success = _success_result()
+    state = manager.storage.load_queue_state()
+    p = QueuedPrompt(content="ready now", max_retries=3, retry_count=1)
+    p.retry_not_before = datetime.now() - timedelta(seconds=1)
+    state.add_prompt(p)
+    manager.storage.save_queue_state(state)
+    manager.state = None
+
+    with patch.object(manager.claude_interface, "execute_prompt", return_value=success):
+        did_work = manager._process_queue_iteration()
+
+    assert did_work is True
+
+
+def test_retry_not_before_not_set_on_final_failure(manager):  # QMG-028
+    """When max retries are exhausted, the prompt becomes FAILED, not QUEUED.
+    retry_not_before is irrelevant for FAILED prompts.
+    """
+    fail = _fail_result("final")
+    state = manager.storage.load_queue_state()
+    p = QueuedPrompt(content="exhausted", max_retries=1, retry_count=1)
+    state.add_prompt(p)
+    manager.storage.save_queue_state(state)
+    manager.state = None
+
+    with patch.object(manager.claude_interface, "execute_prompt", return_value=fail):
+        manager._process_queue_iteration()
+
+    updated = next(pr for pr in manager.state.prompts if pr.id == p.id)
+    assert updated.status == PromptStatus.FAILED
+
+
+def test_retry_not_before_persists_through_reload(manager):  # QMG-029
+    """retry_not_before written to YAML frontmatter survives a state reload."""
+    future = datetime.now() + timedelta(minutes=10)
+    state = manager.storage.load_queue_state()
+    p = QueuedPrompt(content="persist test", max_retries=3, retry_count=1)
+    p.retry_not_before = future
+    state.add_prompt(p)
+    manager.storage.save_queue_state(state)
+
+    reloaded = manager.storage.load_queue_state()
+    reloaded_prompt = next(pr for pr in reloaded.prompts if pr.id == p.id)
+    assert reloaded_prompt.retry_not_before is not None
+    delta = abs((reloaded_prompt.retry_not_before - future).total_seconds())
+    assert delta < 5, f"Persisted retry_not_before drifted by {delta:.3f}s"
+    assert reloaded_prompt.retry_not_before.tzinfo is None
+
+
+def test_retry_not_before_does_not_affect_rate_limited_prompts(manager):  # QMG-030
+    """A RATE_LIMITED prompt must be handled by reset_time / rate_limited_at,
+    not by retry_not_before. The two mechanisms must not interfere.
+    """
+    prompt = QueuedPrompt(
+        content="rate limited", status=PromptStatus.RATE_LIMITED, max_retries=3
+    )
+    prompt.rate_limited_at = datetime.now() - timedelta(minutes=6)
+    prompt.reset_time = None
+    prompt.retry_not_before = datetime.now() + timedelta(hours=1)  # future, but irrelevant
+    prompt.retry_count = 0
+
+    manager.state = QueueState()
+    manager.state.add_prompt(prompt)
+    manager._check_rate_limited_prompts()
+
+    # 5-min heuristic should fire (rate_limited_at > 5min ago, no reset_time)
+    assert prompt.status == PromptStatus.QUEUED
+    assert prompt.should_execute_now() is True, (
+        "Re-queued rate-limited prompt must be immediately selectable; "
+        "retry_not_before must be cleared or already past"
+    )
+
+
+def test_cooldown_prompt_does_not_print_no_prompts_in_queue(manager, capsys):  # QMG-031
+    """When a prompt is in retry_not_before cooldown and no other prompts exist,
+    the iteration must NOT print "No prompts in queue". It must print a cooldown
+    message that includes the remaining wait time.
+    """
+    state = manager.storage.load_queue_state()
+    p = QueuedPrompt(content="cooling down", max_retries=3, retry_count=1)
+    p.retry_not_before = datetime.now() + timedelta(minutes=5)
+    state.add_prompt(p)
+    manager.storage.save_queue_state(state)
+    manager.state = None
+
+    manager._process_queue_iteration()
+
+    captured = capsys.readouterr()
+    assert "No prompts in queue" not in captured.out, (
+        "Must not print 'No prompts in queue' when a prompt is in cooldown"
+    )
+    assert "retry cooldown" in captured.out.lower(), (
+        "Must print a message indicating the prompt is in retry cooldown"
+    )

@@ -643,6 +643,18 @@ def test_detect_rate_limit_fires_at_last_char_of_scan_window(interface):  # S11b
         "x" * _RATE_LIMIT_SCAN_CHARS + "\ntoo many requests to upstream service",
         id="too-many-requests-beyond-scan-window",
     ),
+    pytest.param(
+        "x" * _RATE_LIMIT_SCAN_CHARS + "\nyou are rate limited by upstream proxy",
+        id="rate-limited-beyond-scan-window",
+    ),
+    pytest.param(
+        "x" * _RATE_LIMIT_SCAN_CHARS + '\nsome internal rate_limit_error in debug log',
+        id="rate-limit-error-beyond-scan-window",
+    ),
+    pytest.param(
+        "x" * _RATE_LIMIT_SCAN_CHARS + "\nrate limit exceeded for third-party API",
+        id="rate-limit-exceeded-beyond-scan-window",
+    ),
 ])
 def test_false_positive_not_detected(interface, fp_text):  # S11c
     """Common false-positive strings must NOT trigger rate-limit detection.
@@ -803,3 +815,254 @@ def test_get_available_commands_strips_claudecode_from_env(interface, monkeypatc
         interface.get_available_commands()
     _, kwargs = mock_run.call_args
     assert "CLAUDECODE" not in kwargs["env"]
+
+
+# ===========================================================================
+# Fix 1 — Broader Rate-Limit Pattern Coverage
+# ===========================================================================
+
+
+def test_rate_limit_detected_exceeded_your_rate_limit(interface):  # CLI-045
+    """'exceeded your rate limit' pattern triggers is_rate_limited=True."""
+    result = interface._detect_rate_limit(
+        "Error: you have exceeded your rate limit. Please wait before retrying."
+    )
+    assert result.is_rate_limited is True
+
+
+def test_rate_limit_detected_rate_limit_error_api_type(interface):  # CLI-046
+    """'rate_limit_error' (Anthropic API error type) triggers is_rate_limited=True.
+
+    Uses default broad_patterns=True (stderr context). This pattern is gated
+    behind broad_patterns and will NOT fire with broad_patterns=False (stdout
+    context) — see CLI-049c.
+    """
+    result = interface._detect_rate_limit(
+        'error type: "rate_limit_error", please reduce request frequency'
+    )
+    assert result.is_rate_limited is True
+
+
+def test_rate_limit_detected_youve_reached_your(interface):  # CLI-047
+    """'you've reached your' pattern triggers is_rate_limited=True."""
+    result = interface._detect_rate_limit(
+        "You've reached your usage limit. Your limit will reset at the next window."
+    )
+    assert result.is_rate_limited is True
+
+
+def test_rate_limit_detected_rate_limited(interface):  # CLI-048
+    """'rate limited' (past participle) triggers is_rate_limited=True with broad_patterns=True."""
+    result = interface._detect_rate_limit(
+        "You are rate limited. Please try again later.",
+        broad_patterns=True,
+    )
+    assert result.is_rate_limited is True
+
+
+def test_rate_limited_not_detected_broad_patterns_false(interface):  # CLI-049
+    """'rate limited' is NOT detected when broad_patterns=False.
+
+    Validates the stdout-scan guard: subprocess output that contains 'rate limited'
+    must not trigger a false-positive rate-limit detection when the caller passes
+    broad_patterns=False (as Fix 2's stdout tail scan does).
+    """
+    result = interface._detect_rate_limit(
+        "npm ERR! 429 you are rate limited by the registry. retry after 60s",
+        broad_patterns=False,
+    )
+    assert result.is_rate_limited is False, (
+        "Broad 'rate limited' pattern must not fire when broad_patterns=False"
+    )
+
+
+def test_stdout_safe_pattern_still_fires_broad_patterns_false(interface):  # CLI-049b
+    """Stdout-safe patterns (e.g. 'usage limit reached') still fire when broad_patterns=False."""
+    result = interface._detect_rate_limit(
+        "usage limit reached|9999999999",
+        broad_patterns=False,
+    )
+    assert result.is_rate_limited is True, (
+        "Stdout-safe patterns must remain active regardless of broad_patterns flag"
+    )
+
+
+@pytest.mark.parametrize("broad_phrase", [
+    pytest.param("rate limit exceeded", id="rate-limit-exceeded"),
+    pytest.param("rate_limit_error", id="rate-limit-error-api-type"),
+    pytest.param("too many requests", id="too-many-requests"),
+    pytest.param("quota exceeded", id="quota-exceeded"),
+    pytest.param("rate limited", id="rate-limited"),
+])
+def test_broad_patterns_not_detected_when_false(interface, broad_phrase):  # CLI-049c
+    """All broad patterns must NOT fire when broad_patterns=False.
+
+    Each of these phrases can appear in subprocess output (npm, pip, curl,
+    cloud CLIs, or user-generated code). When broad_patterns=False (stdout
+    scanning context), they must not trigger a false-positive ~5-hour hold.
+    """
+    result = interface._detect_rate_limit(
+        f"Error: {broad_phrase}. Please try again later.",
+        broad_patterns=False,
+    )
+    assert result.is_rate_limited is False, (
+        f"Broad pattern {broad_phrase!r} must not fire when broad_patterns=False"
+    )
+
+
+# ===========================================================================
+# Fix 2 — Stdout Scanning on Non-Zero Return
+# ===========================================================================
+
+
+def test_rate_limit_in_stdout_detected_when_returncode_nonzero(mocker):  # CLI-050
+    """Rate-limit phrase only in stdout is detected when returncode != 0.
+
+    Scenario: mid-execution rate-limit causes CLI to emit notice on stdout
+    (conversation stream) then exit 1.
+    """
+    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
+    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
+
+    future_ts = int(datetime.now().timestamp()) + 7200
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=1, stdout=f"usage limit reached|{future_ts}", stderr=""
+        )
+        result = iface.execute_prompt(QueuedPrompt(content="task"))
+
+    assert result.rate_limit_info.is_rate_limited is True
+    assert result.success is False
+    assert result.rate_limit_info.reset_time is not None
+    assert result.rate_limit_info.reset_time > datetime.now()
+    assert result.rate_limit_info.detection_source == "stdout", (
+        "Stdout-detected rate limits must set detection_source='stdout'"
+    )
+
+
+def test_rate_limit_in_stdout_tail_detected_when_returncode_nonzero(mocker):  # CLI-054
+    """Rate-limit phrase buried at the end of long stdout is detected when returncode != 0.
+
+    Scenario: a long-running conversation (many chars of output) hits a rate limit.
+    The rate-limit notice appears at the very end of stdout — past the first
+    _RATE_LIMIT_SCAN_CHARS characters. The tail-scan in execute_prompt() must find it.
+    """
+    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
+    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
+
+    future_ts = int(datetime.now().timestamp()) + 7200
+    long_conversation = "x" * (_RATE_LIMIT_SCAN_CHARS * 3)
+    stdout_with_tail_notice = long_conversation + f"\nusage limit reached|{future_ts}"
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=1, stdout=stdout_with_tail_notice, stderr=""
+        )
+        result = iface.execute_prompt(QueuedPrompt(content="task"))
+
+    assert result.rate_limit_info.is_rate_limited is True, (
+        "Rate-limit notice at the tail of long stdout must be detected"
+    )
+    assert result.success is False
+
+
+def test_rate_limit_in_stdout_not_detected_when_returncode_zero(mocker):  # CLI-051
+    """Rate-limit phrase in stdout is NOT detected when returncode=0.
+
+    This is the R3 guard: a successful Claude response that discusses rate
+    limits in its text must not be misidentified.
+    """
+    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
+    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="Here is how to handle rate limit exceeded errors in your code.",
+            stderr=""
+        )
+        result = iface.execute_prompt(QueuedPrompt(content="task"))
+
+    assert result.rate_limit_info.is_rate_limited is False
+    assert result.success is True
+
+
+def test_rate_limit_stderr_takes_priority_over_stdout(mocker):  # CLI-052
+    """When both stderr and stdout contain rate-limit text and returncode != 0,
+    the stderr detection wins (stdout scan is not reached when stderr matches).
+    """
+    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
+    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stdout="usage limit reached|111",
+            stderr="rate limit exceeded"
+        )
+        result = iface.execute_prompt(QueuedPrompt(content="task"))
+
+    assert result.rate_limit_info.is_rate_limited is True
+
+
+def test_no_rate_limit_empty_stdout_nonzero_return(mocker):  # CLI-053
+    """Empty stdout with returncode != 0 and no rate-limit text → not rate-limited."""
+    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
+    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=1, stdout="", stderr="Something went wrong"
+        )
+        result = iface.execute_prompt(QueuedPrompt(content="task"))
+
+    assert result.rate_limit_info.is_rate_limited is False
+
+
+def test_subprocess_rate_limited_phrase_in_stdout_not_misidentified(mocker):  # CLI-055
+    """Subprocess output containing 'rate limited' in stdout does NOT trigger
+    rate-limit detection when returncode != 0.
+
+    Scenario: Claude runs a task that invokes npm. npm exits with an error that
+    includes 'rate limited by registry'. Claude exits non-zero because npm failed.
+    Without broad_patterns=False in the stdout scan, this would be misidentified
+    as a Claude API rate limit, triggering a ~5-hour hold.
+    """
+    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
+    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stdout="npm ERR! code E429\nnpm ERR! you are rate limited by the npm registry",
+            stderr="",
+        )
+        result = iface.execute_prompt(QueuedPrompt(content="task"))
+
+    assert result.rate_limit_info.is_rate_limited is False, (
+        "Subprocess 'rate limited' phrase in stdout must not trigger Claude API "
+        "rate-limit detection (broad_patterns=False guard)"
+    )
+    assert result.success is False  # execution did fail, just not from a rate limit
+
+
+def test_rate_limit_error_string_in_user_code_stdout_not_misidentified(mocker):  # CLI-056
+    """'rate_limit_error' appearing in Claude-generated code does NOT trigger
+    rate-limit detection when returncode != 0 (e.g., a downstream test runner fails).
+    """
+    mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
+    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stdout='if error_type == "rate_limit_error":\n    handle_rate_limit()',
+            stderr="",
+        )
+        result = iface.execute_prompt(QueuedPrompt(content="task"))
+
+    assert result.rate_limit_info.is_rate_limited is False, (
+        "'rate_limit_error' in user code echoed to stdout must not trigger "
+        "Claude API rate-limit detection"
+    )
+    assert result.success is False  # process did fail, but not from a rate limit
