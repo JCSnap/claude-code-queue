@@ -19,7 +19,9 @@ def storage(tmp_path):
 def interface(mocker):
     """ClaudeCodeInterface with _verify_claude_available patched out."""
     mocker.patch.object(ClaudeCodeInterface, "_verify_claude_available")
-    return ClaudeCodeInterface(claude_command="claude", timeout=60)
+    iface = ClaudeCodeInterface(claude_command="claude", timeout=60)
+    yield iface
+    iface.close()
 
 
 @pytest.fixture
@@ -29,7 +31,9 @@ def manager(tmp_path, mocker):
     mocker.patch.object(
         ClaudeCodeInterface, "test_connection", return_value=(True, "ok")
     )
-    return QueueManager(storage_dir=str(tmp_path), claude_command="claude")
+    mgr = QueueManager(storage_dir=str(tmp_path), claude_command="claude")
+    yield mgr
+    mgr.claude_interface.close()
 
 
 @pytest.fixture

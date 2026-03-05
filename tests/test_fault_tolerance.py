@@ -153,6 +153,9 @@ def iface():
     obj.claude_command = "claude"
     obj.timeout = 3600
     obj.skip_permissions = True
+    obj._current_process = None
+    obj._interrupted = False
+    obj._escalate_thread = None
     return obj
 
 
@@ -968,10 +971,20 @@ class TestKnownBugs:
 # ===========================================================================
 
 
+def _make_ft_mock_proc(returncode=0, stdout="done", stderr="", pid=99999):
+    """Create a mock Popen for fault-tolerance tests."""
+    proc = MagicMock()
+    proc.communicate.return_value = (stdout, stderr)
+    proc.returncode = returncode
+    proc.pid = pid
+    proc.wait.return_value = returncode
+    return proc
+
+
 def test_subprocess_nonzero_returncode_yields_failure_result(iface, mocker, tmp_path):  # FT-044
     """returncode=137 (SIGKILL) → success=False and is_rate_limited=False."""
-    mock_run = mocker.patch("claude_code_queue.claude_interface.subprocess.run")
-    mock_run.return_value = MagicMock(returncode=137, stdout="", stderr="Killed")
+    mock_proc = _make_ft_mock_proc(returncode=137, stdout="", stderr="Killed")
+    mocker.patch("claude_code_queue.claude_interface.subprocess.Popen", return_value=mock_proc)
 
     prompt = QueuedPrompt(
         id="t01aaaa", content="fix a bug", working_directory=str(tmp_path)
@@ -985,8 +998,10 @@ def test_subprocess_nonzero_returncode_yields_failure_result(iface, mocker, tmp_
 
 def test_subprocess_timeout_returns_timeout_failure(iface, mocker, tmp_path):  # FT-045
     """subprocess.TimeoutExpired is caught and returned as a failure, not re-raised."""
-    mock_run = mocker.patch("claude_code_queue.claude_interface.subprocess.run")
-    mock_run.side_effect = subprocess.TimeoutExpired(cmd=["claude"], timeout=10)
+    mock_proc = _make_ft_mock_proc()
+    mock_proc.communicate.side_effect = subprocess.TimeoutExpired(cmd=["claude"], timeout=10)
+    mocker.patch("claude_code_queue.claude_interface.subprocess.Popen", return_value=mock_proc)
+    mocker.patch.object(ClaudeCodeInterface, "_kill_proc_group")
 
     prompt = QueuedPrompt(
         id="t02aaaa", content="some task", working_directory=str(tmp_path)
@@ -1001,8 +1016,8 @@ def test_subprocess_timeout_returns_timeout_failure(iface, mocker, tmp_path):  #
 
 def test_subprocess_oserror_returns_failure_not_exception(iface, mocker, tmp_path):  # FT-046
     """OSError inside execute_prompt() is caught and returned as failure."""
-    mock_run = mocker.patch("claude_code_queue.claude_interface.subprocess.run")
-    mock_run.side_effect = OSError("Connection reset by peer")
+    mocker.patch("claude_code_queue.claude_interface.subprocess.Popen",
+                 side_effect=OSError("Connection reset by peer"))
 
     prompt = QueuedPrompt(
         id="t03aaaa", content="some task", working_directory=str(tmp_path)
@@ -1015,8 +1030,8 @@ def test_subprocess_oserror_returns_failure_not_exception(iface, mocker, tmp_pat
 
 def test_subprocess_generic_exception_returns_failure(iface, mocker, tmp_path):  # FT-047
     """RuntimeError inside execute_prompt() is caught via generic except clause."""
-    mock_run = mocker.patch("claude_code_queue.claude_interface.subprocess.run")
-    mock_run.side_effect = RuntimeError("unexpected internal error")
+    mocker.patch("claude_code_queue.claude_interface.subprocess.Popen",
+                 side_effect=RuntimeError("unexpected internal error"))
 
     prompt = QueuedPrompt(
         id="t04aaaa", content="task", working_directory=str(tmp_path)
@@ -1034,8 +1049,10 @@ def test_working_dir_restored_after_subprocess_timeout(iface, mocker, tmp_path):
 
     original_cwd = os.getcwd()
 
-    mock_run = mocker.patch("claude_code_queue.claude_interface.subprocess.run")
-    mock_run.side_effect = subprocess.TimeoutExpired(cmd=["claude"], timeout=10)
+    mock_proc = _make_ft_mock_proc()
+    mock_proc.communicate.side_effect = subprocess.TimeoutExpired(cmd=["claude"], timeout=10)
+    mocker.patch("claude_code_queue.claude_interface.subprocess.Popen", return_value=mock_proc)
+    mocker.patch.object(ClaudeCodeInterface, "_kill_proc_group")
 
     prompt = QueuedPrompt(
         id="t05aaaa", content="task", working_directory=str(work_dir)
@@ -1052,8 +1069,8 @@ def test_working_dir_restored_after_generic_exception(iface, mocker, tmp_path): 
 
     original_cwd = os.getcwd()
 
-    mock_run = mocker.patch("claude_code_queue.claude_interface.subprocess.run")
-    mock_run.side_effect = RuntimeError("boom")
+    mocker.patch("claude_code_queue.claude_interface.subprocess.Popen",
+                 side_effect=RuntimeError("boom"))
 
     prompt = QueuedPrompt(
         id="t06aaaa", content="task", working_directory=str(work_dir)
@@ -1065,8 +1082,8 @@ def test_working_dir_restored_after_generic_exception(iface, mocker, tmp_path): 
 
 def test_execute_prompt_returncode_137_not_rate_limited(iface, mocker, tmp_path):  # FT-050
     """SIGKILL exit (returncode 137) with 'Killed' in stdout is NOT rate-limited."""
-    mock_run = mocker.patch("claude_code_queue.claude_interface.subprocess.run")
-    mock_run.return_value = MagicMock(returncode=137, stdout="Killed", stderr="")
+    mock_proc = _make_ft_mock_proc(returncode=137, stdout="Killed", stderr="")
+    mocker.patch("claude_code_queue.claude_interface.subprocess.Popen", return_value=mock_proc)
 
     prompt = QueuedPrompt(
         id="t07aaaa", content="some work", working_directory=str(tmp_path)
@@ -1416,10 +1433,12 @@ class TestSIGKILLRecovery:
 
 def test_network_timeout_during_execution_returns_failure(iface, mocker, tmp_path):  # FT-067
     """Hung network call → TimeoutExpired → caught as failure, not re-raised."""
-    mock_run = mocker.patch("claude_code_queue.claude_interface.subprocess.run")
-    mock_run.side_effect = subprocess.TimeoutExpired(
+    mock_proc = _make_ft_mock_proc()
+    mock_proc.communicate.side_effect = subprocess.TimeoutExpired(
         cmd=["claude", "--print", "..."], timeout=3600
     )
+    mocker.patch("claude_code_queue.claude_interface.subprocess.Popen", return_value=mock_proc)
+    mocker.patch.object(ClaudeCodeInterface, "_kill_proc_group")
 
     prompt = QueuedPrompt(
         id="t24aaaa", content="fetch data", working_directory=str(tmp_path)
@@ -1433,12 +1452,12 @@ def test_network_timeout_during_execution_returns_failure(iface, mocker, tmp_pat
 
 def test_network_failure_nonzero_returncode_not_rate_limited(iface, mocker, tmp_path):  # FT-068
     """returncode=1 with DNS error in stderr → failure, not rate-limited."""
-    mock_run = mocker.patch("claude_code_queue.claude_interface.subprocess.run")
-    mock_run.return_value = MagicMock(
+    mock_proc = _make_ft_mock_proc(
         returncode=1,
         stdout="",
         stderr="curl: (6) Could not resolve host: api.anthropic.com",
     )
+    mocker.patch("claude_code_queue.claude_interface.subprocess.Popen", return_value=mock_proc)
 
     prompt = QueuedPrompt(
         id="t25aaaa", content="some task", working_directory=str(tmp_path)
@@ -1603,12 +1622,12 @@ def test_auth_error_text_not_classified_as_rate_limit(iface, error_string):  # F
 
 def test_auth_failure_returncode_nonzero_produces_failure_result(iface, mocker, tmp_path):  # FT-076
     """returncode=1 with auth error in stderr → success=False, is_rate_limited=False."""
-    mock_run = mocker.patch("claude_code_queue.claude_interface.subprocess.run")
-    mock_run.return_value = MagicMock(
+    mock_proc = _make_ft_mock_proc(
         returncode=1,
         stdout="",
         stderr="Error: Not authenticated. Please run 'claude login'.",
     )
+    mocker.patch("claude_code_queue.claude_interface.subprocess.Popen", return_value=mock_proc)
 
     prompt = QueuedPrompt(
         id="t33aaaa", content="task", working_directory=str(tmp_path)

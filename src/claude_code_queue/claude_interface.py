@@ -2,11 +2,14 @@
 Interface for executing prompts via Claude Code CLI.
 """
 
+import atexit
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -49,6 +52,32 @@ _NON_RETRYABLE_PATTERNS = [
     "claude code cannot be launched inside another claude code session",
 ]
 
+# signal.SIGKILL is not defined on Windows (only POSIX).  Referencing it
+# directly (e.g., signal.SIGKILL) raises AttributeError on Windows.  This
+# constant provides the numeric value (9) on all platforms so callers never
+# need a getattr guard at every call site.  _kill_proc_group() already
+# handles the Windows fallback (proc.kill() instead of os.killpg).
+_SIGKILL = getattr(signal, "SIGKILL", 9)
+
+# signal.SIGTERM exists on both POSIX and Windows, but define it as a
+# module constant for symmetry with _SIGKILL and to allow tests to import
+# it alongside _SIGKILL without referencing the signal module directly.
+_SIGTERM = getattr(signal, "SIGTERM", 15)
+
+# Seconds to wait for the subprocess to exit after SIGTERM before
+# escalating to SIGKILL.  3 seconds balances responsiveness (user expects
+# fast Ctrl+C) with giving well-behaved processes time to clean up.
+# Most processes exit within 100ms of SIGTERM; 3s is generous.
+# Used by the daemon thread in kill_current().
+_KILL_ESCALATION_TIMEOUT_S = 3
+
+# Seconds to wait for the subprocess leader to exit after SIGKILL in the
+# except-TimeoutExpired handler.  SIGKILL is immediate (the only exception
+# is a process stuck in uninterruptible sleep / D state), so 2 seconds is
+# generous.  Caps the proc.wait() call so an unusual delay cannot block
+# the queue indefinitely.
+_DRAIN_TIMEOUT_S = 2
+
 
 class ClaudeCodeInterface:
     """Interface for executing prompts via Claude Code CLI."""
@@ -58,6 +87,16 @@ class ClaudeCodeInterface:
         self.claude_command = claude_command
         self.timeout = timeout
         self.skip_permissions = skip_permissions
+        self._current_process: Optional[subprocess.Popen] = None
+        self._interrupted: bool = False
+        self._escalate_thread: Optional[threading.Thread] = None
+
+        # Defense-in-depth: if the Python process exits without going through
+        # _signal_handler() or the except-BaseException cleanup, kill any
+        # still-running subprocess rather than leaving it orphaned.
+        self._atexit_handler = self._atexit_cleanup
+        atexit.register(self._atexit_handler)
+
         self._verify_claude_available()
 
     def _verify_claude_available(self) -> None:
@@ -106,6 +145,116 @@ class ClaudeCodeInterface:
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError("Claude Code CLI verification timed out.")
+
+    def _atexit_cleanup(self) -> None:
+        """Wrapper for atexit — survives interpreter shutdown.
+
+        During interpreter shutdown, module globals (``os``, ``signal``,
+        ``sys``) may already be set to ``None``.  This wrapper swallows
+        all exceptions so the shutdown sequence is never disrupted.
+        """
+        try:
+            self.kill_current()
+        except BaseException:
+            pass
+
+    def close(self) -> None:
+        """Unregister the atexit handler.
+
+        Call this when the ``ClaudeCodeInterface`` instance is no longer
+        needed (e.g., in test fixture teardown) to prevent atexit handlers
+        from accumulating across the process lifetime.  Safe to call
+        multiple times — ``atexit.unregister`` is a no-op if the callable
+        was never registered or was already unregistered.
+        """
+        atexit.unregister(self._atexit_handler)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    @staticmethod
+    def _kill_proc_group(proc: subprocess.Popen, sig: int) -> bool:
+        """Send *sig* to the subprocess's process group, or to the process
+        directly on Windows where ``os.killpg`` is absent.
+
+        INVARIANT: This method uses ``proc.pid`` as the PGID.  This is only
+        correct because ``execute_prompt()`` launches the subprocess with
+        ``start_new_session=True`` (POSIX), making the child a session leader
+        whose PID == PGID.
+
+        Returns ``True`` if the signal was sent successfully, ``False`` if the
+        process group was already gone (``OSError``).
+        """
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(proc.pid, sig)
+            else:
+                # Windows: no process-group kill; fall back to single-process.
+                if sig == _SIGKILL:
+                    proc.kill()
+                else:
+                    proc.terminate()
+            return True
+        except (OSError, AttributeError):
+            return False
+
+    def kill_current(self) -> None:
+        """Terminate the currently-running claude subprocess, if any.
+
+        Safe to call from a signal handler — returns immediately after
+        sending SIGTERM.  A daemon thread escalates to SIGKILL after
+        ``_KILL_ESCALATION_TIMEOUT_S`` seconds if the child has not exited.
+
+        NOTE: Uses ``os.write(2, ...)`` instead of ``print()`` to avoid
+        re-entering the stream lock if the main thread is mid-print.
+        """
+        proc = self._current_process
+
+        if proc is None:
+            return
+
+        # Signal-safe stderr write
+        try:
+            os.write(2, f"Terminating subprocess (pid={proc.pid})...\n".encode())
+        except OSError:
+            pass
+
+        if not self._kill_proc_group(proc, _SIGTERM):
+            return                    # process group already gone
+
+        self._interrupted = True
+
+        # Escalate to SIGKILL in a daemon thread so the signal handler
+        # returns immediately.
+        #
+        # Capture references as locals: during interpreter shutdown, module
+        # globals may already be None.
+        _kill = ClaudeCodeInterface._kill_proc_group
+        _sigkill = _SIGKILL
+        _escalation_timeout = _KILL_ESCALATION_TIMEOUT_S
+
+        def _escalate(p: subprocess.Popen) -> None:
+            try:
+                try:
+                    p.wait(timeout=_escalation_timeout)
+                    return
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.write(2, f"Subprocess (pid={p.pid}) ignored SIGTERM for "
+                                 f"{_escalation_timeout}s; escalating to SIGKILL\n".encode())
+                    except (OSError, AttributeError):
+                        pass
+                    _kill(p, _sigkill)
+            except BaseException:
+                pass
+
+        self._escalate_thread = threading.Thread(
+            target=_escalate, args=(proc,), daemon=True
+        )
+        self._escalate_thread.start()
 
     def execute_prompt(self, prompt: QueuedPrompt) -> ExecutionResult:
         """Execute a prompt via Claude Code CLI."""
@@ -164,9 +313,60 @@ class ClaudeCodeInterface:
             # anti-nesting guard. The rest of the environment (PATH, HOME, API keys, etc.)
             # is preserved unchanged.
             subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=self.timeout,
-                cwd=str(working_dir), env=subprocess_env
+
+            # Captures the interrupt flag across all exit paths — see finally block.
+            _was_interrupted = False
+
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,    # isolate from terminal SIGINT; also required by _kill_proc_group()
+                cwd=str(working_dir),
+                env=subprocess_env,
+            )
+            self._interrupted = False             # clear stale flag before registering proc
+            self._current_process = proc
+
+            try:
+                stdout, stderr = proc.communicate(timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                ClaudeCodeInterface._kill_proc_group(proc, _SIGKILL)
+                try:
+                    proc.wait(timeout=_DRAIN_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    pass
+                for _pipe in (proc.stdout, proc.stderr):
+                    if _pipe:
+                        try:
+                            _pipe.close()
+                        except OSError:
+                            pass
+                raise
+            except BaseException:
+                ClaudeCodeInterface._kill_proc_group(proc, _SIGKILL)
+                for _pipe in (proc.stdout, proc.stderr):
+                    if _pipe:
+                        try:
+                            _pipe.close()
+                        except OSError:
+                            pass
+                raise
+            finally:
+                self._current_process = None
+                _was_interrupted = self._interrupted
+                self._interrupted = False
+
+            if _was_interrupted:
+                raise KeyboardInterrupt
+
+            result = subprocess.CompletedProcess(
+                cmd,
+                proc.returncode,
+                stdout=stdout,
+                stderr=stderr,
             )
 
             execution_time = time.time() - start_time
@@ -229,6 +429,10 @@ class ClaudeCodeInterface:
                 execution_time=execution_time,
             )
         except Exception as e:
+            # If a signal-driven kill was requested but communicate() raised
+            # an exception instead of returning normally, treat as interrupt.
+            if _was_interrupted:
+                raise KeyboardInterrupt
             execution_time = time.time() - start_time
             return ExecutionResult(
                 success=False,
@@ -448,6 +652,13 @@ class ClaudeCodeInterface:
     def execute_simple_prompt(
         self, prompt_text: str, working_dir: str = "."
     ) -> ExecutionResult:
-        """Execute a simple prompt without full QueuedPrompt object."""
+        """Execute a simple prompt without full QueuedPrompt object.
+
+        Note: Ctrl+C kills the subprocess via the ``except BaseException``
+        cleanup, but does not revert the prompt to QUEUED (no ``_shutdown()``
+        exists in standalone usage).  For full Ctrl+C support with automatic
+        revert, use ``QueueManager`` which installs signal handlers that call
+        ``kill_current()``.
+        """
         simple_prompt = QueuedPrompt(content=prompt_text, working_directory=working_dir)
         return self.execute_prompt(simple_prompt)
