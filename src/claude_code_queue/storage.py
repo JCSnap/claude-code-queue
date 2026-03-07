@@ -242,6 +242,22 @@ class QueueStorage:
                 self._remove_prompt_files(prompt.id, self.queue_dir)
             else:  # QUEUED
                 target_dir = self.queue_dir
+                # Fix 1b — Remove any stale .executing.md or .rate-limited.md file
+                # left over from a previous run that crashed before transitioning.
+                # Without this, the orphaned file is picked up on reload as EXECUTING,
+                # causing the retried QUEUED file to be ignored.
+                #
+                # IMPORTANT: Use exact filenames (not globs) so we only remove THIS
+                # prompt's stale suffixed files. A glob like "{id}-*.executing.md"
+                # would also match sibling prompts that share the same id prefix
+                # (e.g. all "reorder-kernel*.md" files share id="reorder"), deleting
+                # the currently-running job's .executing.md crash-recovery file.
+                for suffix in (".executing.md", ".rate-limited.md"):
+                    stale = self.queue_dir / base_filename.replace(".md", suffix)
+                    try:
+                        stale.unlink(missing_ok=True)
+                    except Exception as e:
+                        print(f"Error removing file {stale}: {e}")
             file_path = target_dir / base_filename
             return self.parser.write_prompt_file(prompt, file_path)
         except Exception as e:
