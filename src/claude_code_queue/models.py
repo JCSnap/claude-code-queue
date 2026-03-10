@@ -39,6 +39,7 @@ class QueuedPrompt:
     rate_limited_at: Optional[datetime] = None
     reset_time: Optional[datetime] = None
     retry_not_before: Optional[datetime] = None  # Fix 3: earliest time for next generic retry
+    _resolved_working_directory: Optional[str] = field(default=None, repr=False)  # transient; not persisted to YAML
 
     def add_log(self, message: str) -> None:
         """Add a log entry with timestamp."""
