@@ -12,11 +12,17 @@ authors = [
   { name="Justin Cheah", email="justinwoody1234@gmail.com" }
 ]
 dependencies = [
-  # Add your dependencies here
+  "PyYAML >= 6.0",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-mock"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+claude_code_queue = ["py.typed"]
 
 [[tool.setuptools-rust.bins]]
 target = "prompt-box"
@@ -24,3 +30,6 @@ path = "claude-prompt-box/Cargo.toml"
 
 [project.scripts]
 claude-queue = "claude_code_queue.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
