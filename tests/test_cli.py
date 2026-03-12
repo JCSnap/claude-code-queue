@@ -936,3 +936,269 @@ class TestPromptBoxCommand:
         assert code == 0
         cmd = mock_run.call_args[0][0]
         assert cmd[0] == expected_binary
+
+
+# ===========================================================================
+# `batch` Command
+# ===========================================================================
+
+def _make_mock_prompt(priority=5, content="Review file.h", working_directory="/src"):
+    """Build a minimal QueuedPrompt-like mock for batch tests."""
+    p = MagicMock(spec=QueuedPrompt)
+    p.priority = priority
+    p.content = content
+    p.working_directory = working_directory
+    return p
+
+
+class TestBatchNoSubcommand:
+    def test_batch_no_subcommand_returns_1(self, capsys):
+        with patch("sys.argv", ["claude-queue", "batch"]):
+            with patch("claude_code_queue.cli.QueueStorage"):
+                code = main()
+        assert code == 1
+        assert "No batch operation specified" in capsys.readouterr().out
+
+
+class TestBatchGenerate:
+    def _run(self, tmp_path, *extra_args, prompts=None, resolve_side_effect=None,
+             generate_side_effect=None):
+        """Run `claude-queue batch generate tmpl --data data.csv [extra_args]`.
+
+        Creates a real data file so the is_file() check passes.
+        Patches resolve_template_path and generate_batch_jobs.
+        """
+        data_file = tmp_path / "data.csv"
+        data_file.write_text("project,filename\nvolk,a.h\n")
+
+        template_file = tmp_path / "template.md"
+        template_file.write_text("---\npriority: 5\n---\n\nhello")
+
+        mock_storage = MagicMock()
+        mock_storage.bank_dir = tmp_path / "bank"
+
+        if prompts is None:
+            prompts = [_make_mock_prompt(priority=10), _make_mock_prompt(priority=15)]
+
+        argv = [
+            "claude-queue", "batch", "generate", str(template_file),
+            "--data", str(data_file),
+        ] + list(extra_args)
+
+        with patch("sys.argv", argv):
+            with patch("claude_code_queue.cli.QueueStorage", return_value=mock_storage):
+                with patch(
+                    "claude_code_queue.cli.resolve_template_path",
+                    side_effect=resolve_side_effect or (lambda ref, bank: template_file),
+                ):
+                    with patch(
+                        "claude_code_queue.cli.generate_batch_jobs",
+                        side_effect=generate_side_effect or (lambda **kw: prompts),
+                    ):
+                        code = main()
+        return code
+
+    def test_batch_generate_success(self, tmp_path, capsys):
+        code = self._run(tmp_path)
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "Generated 2 job(s)" in out
+
+    def test_batch_generate_success_shows_priority_range(self, tmp_path, capsys):
+        prompts = [_make_mock_prompt(priority=10), _make_mock_prompt(priority=15)]
+        self._run(tmp_path, prompts=prompts)
+        out = capsys.readouterr().out
+        assert "10" in out
+        assert "15" in out
+
+    def test_batch_generate_single_job_priority_range(self, tmp_path, capsys):
+        prompts = [_make_mock_prompt(priority=5)]
+        self._run(tmp_path, prompts=prompts)
+        out = capsys.readouterr().out
+        assert "1 job(s)" in out
+        # min and max are both 5
+        assert out.count("5") >= 2
+
+    def test_batch_generate_dry_run_output(self, tmp_path, capsys):
+        prompts = [_make_mock_prompt(priority=7, content="Review x.h in project")]
+        code = self._run(tmp_path, "--dry-run", prompts=prompts)
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "Dry run" in out
+        assert "would generate" in out
+
+    def test_batch_generate_data_file_not_found(self, tmp_path, capsys):
+        """Missing data file → return 1 before touching template or generate."""
+        with patch("sys.argv", [
+            "claude-queue", "batch", "generate", "tmpl",
+            "--data", str(tmp_path / "nonexistent.csv"),
+        ]):
+            with patch("claude_code_queue.cli.QueueStorage"):
+                code = main()
+        assert code == 1
+        assert "Data file not found" in capsys.readouterr().out
+
+    def test_batch_generate_template_not_found(self, tmp_path, capsys):
+        code = self._run(
+            tmp_path,
+            resolve_side_effect=FileNotFoundError("Template 'tmpl' not found"),
+        )
+        assert code == 1
+        assert "Error:" in capsys.readouterr().out
+
+    def test_batch_generate_validation_error(self, tmp_path, capsys):
+        code = self._run(
+            tmp_path,
+            generate_side_effect=ValueError("Template variables not found in data"),
+        )
+        assert code == 1
+        assert "Error:" in capsys.readouterr().out
+
+
+class TestBatchValidate:
+    def _run(self, tmp_path, template_text, csv_text, *extra_args,
+             resolve_side_effect=None):
+        """Run `claude-queue batch validate tmpl --data data.csv`."""
+        template_file = tmp_path / "template.md"
+        template_file.write_text(template_text)
+
+        data_file = tmp_path / "data.csv"
+        data_file.write_text(csv_text)
+
+        mock_storage = MagicMock()
+        mock_storage.bank_dir = tmp_path / "bank"
+
+        argv = [
+            "claude-queue", "batch", "validate", str(template_file),
+            "--data", str(data_file),
+        ] + list(extra_args)
+
+        with patch("sys.argv", argv):
+            with patch("claude_code_queue.cli.QueueStorage", return_value=mock_storage):
+                with patch(
+                    "claude_code_queue.cli.resolve_template_path",
+                    side_effect=resolve_side_effect or (lambda ref, bank: template_file),
+                ):
+                    code = main()
+        return code
+
+    def test_batch_validate_valid_returns_0(self, tmp_path, capsys):
+        code = self._run(
+            tmp_path,
+            "---\npriority: 0\n---\n\nHello {{name}}",
+            "name\nalice\n",
+        )
+        assert code == 0
+        assert "Valid:" in capsys.readouterr().out
+
+    def test_batch_validate_with_warnings_returns_0(self, tmp_path, capsys):
+        code = self._run(
+            tmp_path,
+            "---\npriority: 0\n---\n\nHello {{name}}",
+            "name,extra\nalice,unused\n",
+        )
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "Warning" in out
+        assert "Valid with warnings" in out
+
+    def test_batch_validate_with_errors_returns_1(self, tmp_path, capsys):
+        """Template references {{name}} but CSV only has 'other' column → error."""
+        code = self._run(
+            tmp_path,
+            "---\npriority: 0\n---\n\nHello {{name}}",
+            "other\nval\n",
+        )
+        assert code == 1
+        assert "Error" in capsys.readouterr().out
+
+    def test_batch_validate_data_file_not_found(self, tmp_path, capsys):
+        template_file = tmp_path / "t.md"
+        template_file.write_text("hello")
+        mock_storage = MagicMock()
+        mock_storage.bank_dir = tmp_path / "bank"
+
+        with patch("sys.argv", [
+            "claude-queue", "batch", "validate", str(template_file),
+            "--data", str(tmp_path / "nonexistent.csv"),
+        ]):
+            with patch("claude_code_queue.cli.QueueStorage", return_value=mock_storage):
+                code = main()
+        assert code == 1
+        assert "Data file not found" in capsys.readouterr().out
+
+    def test_batch_validate_template_not_found(self, tmp_path, capsys):
+        data_file = tmp_path / "data.csv"
+        data_file.write_text("name\nalice\n")
+        mock_storage = MagicMock()
+        mock_storage.bank_dir = tmp_path / "bank"
+
+        with patch("sys.argv", [
+            "claude-queue", "batch", "validate", "nonexistent",
+            "--data", str(data_file),
+        ]):
+            with patch("claude_code_queue.cli.QueueStorage", return_value=mock_storage):
+                with patch(
+                    "claude_code_queue.cli.resolve_template_path",
+                    side_effect=FileNotFoundError("not found"),
+                ):
+                    code = main()
+        assert code == 1
+        assert "Error:" in capsys.readouterr().out
+
+    def test_batch_validate_output_shows_row_count(self, tmp_path, capsys):
+        self._run(
+            tmp_path,
+            "---\npriority: 0\n---\n\nHello {{name}}",
+            "name\nalice\nbob\ncharlie\n",
+        )
+        out = capsys.readouterr().out
+        assert "3 row(s)" in out
+
+
+class TestBatchVariables:
+    def _run(self, tmp_path, template_text, resolve_side_effect=None):
+        template_file = tmp_path / "template.md"
+        template_file.write_text(template_text)
+
+        mock_storage = MagicMock()
+        mock_storage.bank_dir = tmp_path / "bank"
+
+        with patch("sys.argv", ["claude-queue", "batch", "variables", str(template_file)]):
+            with patch("claude_code_queue.cli.QueueStorage", return_value=mock_storage):
+                with patch(
+                    "claude_code_queue.cli.resolve_template_path",
+                    side_effect=resolve_side_effect or (lambda ref, bank: template_file),
+                ):
+                    code = main()
+        return code
+
+    def test_batch_variables_lists_variables(self, tmp_path, capsys):
+        code = self._run(tmp_path, "---\npriority: 0\n---\n\nReview {{filename}} in {{project}}")
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "{{filename}}" in out
+        assert "{{project}}" in out
+
+    def test_batch_variables_no_variables(self, tmp_path, capsys):
+        code = self._run(tmp_path, "---\npriority: 0\n---\n\nNo placeholders here")
+        assert code == 0
+        assert "No variables found" in capsys.readouterr().out
+
+    def test_batch_variables_template_not_found(self, tmp_path, capsys):
+        mock_storage = MagicMock()
+        mock_storage.bank_dir = tmp_path / "bank"
+
+        with patch("sys.argv", ["claude-queue", "batch", "variables", "nonexistent"]):
+            with patch("claude_code_queue.cli.QueueStorage", return_value=mock_storage):
+                with patch(
+                    "claude_code_queue.cli.resolve_template_path",
+                    side_effect=FileNotFoundError("not found"),
+                ):
+                    code = main()
+        assert code == 1
+        assert "Error:" in capsys.readouterr().out
+
+    def test_batch_variables_returns_0(self, tmp_path):
+        code = self._run(tmp_path, "---\npriority: 0\n---\n\nProcess {{item}}")
+        assert code == 0

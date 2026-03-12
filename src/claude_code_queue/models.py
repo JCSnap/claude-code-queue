@@ -39,6 +39,7 @@ class QueuedPrompt:
     rate_limited_at: Optional[datetime] = None
     reset_time: Optional[datetime] = None
     retry_not_before: Optional[datetime] = None  # Fix 3: earliest time for next generic retry
+    _resolved_working_directory: Optional[str] = field(default=None, repr=False)  # transient; not persisted to YAML
 
     def add_log(self, message: str) -> None:
         """Add a log entry with timestamp."""
@@ -148,6 +149,16 @@ class QueueState:
     def get_next_prompt(self) -> Optional[QueuedPrompt]:
         """Get the next prompt to execute (highest priority, can execute now)."""
         now = datetime.now()
+
+        # If any prompt is actively rate-limited (reset window not yet reached),
+        # don't start new work — we're already known to be rate-limited and firing
+        # more requests would just pile up additional rate-limit hits.
+        if any(
+            p.status == PromptStatus.RATE_LIMITED and not p.should_execute_now(now)
+            for p in self.prompts
+        ):
+            return None
+
         executable_prompts = [
             p
             for p in self.prompts

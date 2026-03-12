@@ -11,7 +11,15 @@ import os
 import subprocess
 import sys
 from datetime import datetime
+from pathlib import Path
 
+from .batch import (
+    extract_variables,
+    generate_batch_jobs,
+    read_data_file,
+    resolve_template_path,
+    validate_batch,
+)
 from .queue_manager import QueueManager
 from .storage import QueueStorage
 from .models import QueuedPrompt, PromptStatus
@@ -44,6 +52,15 @@ Examples:
   # Use a template from bank (adds to queue)
   python -m claude_code_queue.cli bank use update-docs
 
+  # Generate batch jobs from template + CSV
+  python -m claude_code_queue.cli batch generate my-template --data entries.csv
+
+  # Preview batch generation (dry run)
+  python -m claude_code_queue.cli batch generate my-template --data entries.csv --dry-run
+
+  # List variables in a batch template
+  python -m claude_code_queue.cli batch variables my-template
+
   # Check queue status
   python -m claude_code_queue.cli status
 
@@ -52,6 +69,9 @@ Examples:
 
   # Test Claude Code connection
   python -m claude_code_queue.cli test
+
+  # Install the Claude Code /queue skill
+  python -m claude_code_queue.cli install-skill
         """,
     )
 
@@ -166,6 +186,61 @@ Examples:
     bank_delete_parser = bank_subparsers.add_parser("delete", help="Delete template from bank")
     bank_delete_parser.add_argument("template_name", help="Template name to delete")
 
+    # Batch subcommands
+    batch_parser = subparsers.add_parser(
+        "batch", help="Generate jobs from a template and data file"
+    )
+    batch_subparsers = batch_parser.add_subparsers(
+        dest="batch_command", help="Batch operations"
+    )
+
+    batch_generate_parser = batch_subparsers.add_parser(
+        "generate", help="Generate queue jobs from template + data"
+    )
+    batch_generate_parser.add_argument(
+        "template", help="Bank template name or path to template file"
+    )
+    batch_generate_parser.add_argument(
+        "--data", "-d", required=True, help="Path to CSV/TSV data file"
+    )
+    batch_generate_parser.add_argument(
+        "--base-priority", type=int, default=None,
+        help="Starting priority (auto-increments per row)",
+    )
+    batch_generate_parser.add_argument(
+        "--priority-step", type=int, default=1,
+        help="Priority increment per row (default: 1)",
+    )
+    batch_generate_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Preview what would be generated without creating jobs",
+    )
+
+    batch_validate_parser = batch_subparsers.add_parser(
+        "validate", help="Validate template variables against data columns"
+    )
+    batch_validate_parser.add_argument(
+        "template", help="Bank template name or path to template file"
+    )
+    batch_validate_parser.add_argument(
+        "--data", "-d", required=True, help="Path to CSV/TSV data file"
+    )
+
+    batch_variables_parser = batch_subparsers.add_parser(
+        "variables", help="List template variables ({{placeholders}})"
+    )
+    batch_variables_parser.add_argument(
+        "template", help="Bank template name or path to template file"
+    )
+
+    # Install skill subcommand
+    install_skill_parser = subparsers.add_parser(
+        "install-skill", help="Install the Claude Code skill to ~/.claude/skills/"
+    )
+    install_skill_parser.add_argument(
+        "--force", action="store_true", help="Overwrite existing skill file"
+    )
+
     # Prompt box subcommand
     prompt_box_parser = subparsers.add_parser(
         "prompt-box", help="Launch the interactive prompt box CLI", add_help=False
@@ -200,6 +275,10 @@ Examples:
             return cmd_list(args)
         elif args.command == "bank":
             return cmd_bank(args)
+        elif args.command == "batch":
+            return cmd_batch(args)
+        elif args.command == "install-skill":
+            return cmd_install_skill(args)
         elif args.command == "prompt-box":
             return cmd_prompt_box(args)
         else:
@@ -494,6 +573,152 @@ def cmd_bank_delete(args) -> int:
     else:
         print(f"✗ Template '{args.template_name}' not found in bank")
     return 0 if success else 1
+
+
+def cmd_batch(args) -> int:
+    """Handle batch subcommands."""
+    if not args.batch_command:
+        print("Error: No batch operation specified")
+        print("Available operations: generate, validate, variables")
+        return 1
+
+    if args.batch_command == "generate":
+        return cmd_batch_generate(args)
+    elif args.batch_command == "validate":
+        return cmd_batch_validate(args)
+    elif args.batch_command == "variables":
+        return cmd_batch_variables(args)
+    else:
+        print(f"Unknown batch operation: {args.batch_command}")
+        return 1
+
+
+def cmd_batch_generate(args) -> int:
+    """Generate queue jobs from a template and data file."""
+    storage = QueueStorage(storage_dir=args.storage_dir)
+    data_path = Path(args.data)
+
+    if not data_path.is_file():
+        print(f"Data file not found: {args.data}")
+        return 1
+
+    try:
+        template_path = resolve_template_path(args.template, storage.bank_dir)
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        return 1
+
+    try:
+        prompts = generate_batch_jobs(
+            template_path=template_path,
+            data_path=data_path,
+            storage=storage,
+            base_priority=args.base_priority,
+            priority_step=args.priority_step,
+            dry_run=args.dry_run,
+        )
+    except (ValueError, FileNotFoundError) as e:
+        print(f"Error: {e}")
+        return 1
+
+    if args.dry_run:
+        print(f"Dry run: would generate {len(prompts)} job(s)")
+        print("-" * 60)
+        for i, prompt in enumerate(prompts):
+            print(f"  [{i + 1}] P{prompt.priority} | {prompt.working_directory}")
+            print(f"      {prompt.content[:70]}{'...' if len(prompt.content) > 70 else ''}")
+    else:
+        print(f"Generated {len(prompts)} job(s) from template '{args.template}'")
+        if prompts:
+            priorities = [p.priority for p in prompts]
+            print(f"  Priority range: {min(priorities)}–{max(priorities)}")
+
+    return 0
+
+
+def cmd_batch_validate(args) -> int:
+    """Validate template variables against data columns."""
+    storage = QueueStorage(storage_dir=args.storage_dir)
+    data_path = Path(args.data)
+
+    if not data_path.is_file():
+        print(f"Data file not found: {args.data}")
+        return 1
+
+    try:
+        template_path = resolve_template_path(args.template, storage.bank_dir)
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        return 1
+
+    template_text = template_path.read_text(encoding="utf-8")
+    template_vars = extract_variables(template_text)
+    columns, rows = read_data_file(data_path)
+    errors, warnings = validate_batch(template_vars, columns)
+
+    print(f"Template: {template_path}")
+    print(f"Data: {data_path} ({len(rows)} row(s), {len(columns)} column(s))")
+    print(f"Variables: {sorted(template_vars) if template_vars else '(none)'}")
+    print(f"Columns: {columns if columns else '(none)'}")
+
+    if errors:
+        for err in errors:
+            print(f"\nError: {err}")
+    if warnings:
+        for warn in warnings:
+            print(f"\nWarning: {warn}")
+
+    if not errors and not warnings:
+        print(f"\nValid: {len(rows)} job(s) would be generated")
+    elif not errors:
+        print(f"\nValid with warnings: {len(rows)} job(s) would be generated")
+
+    return 1 if errors else 0
+
+
+def cmd_batch_variables(args) -> int:
+    """List template variables."""
+    storage = QueueStorage(storage_dir=args.storage_dir)
+
+    try:
+        template_path = resolve_template_path(args.template, storage.bank_dir)
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        return 1
+
+    template_text = template_path.read_text(encoding="utf-8")
+    variables = extract_variables(template_text)
+
+    print(f"Template: {template_path}")
+    if variables:
+        print(f"Variables ({len(variables)}):")
+        for var in sorted(variables):
+            print(f"  {{{{{var}}}}}")
+    else:
+        print("No variables found in template")
+
+    return 0
+
+
+def cmd_install_skill(args) -> int:
+    """Install the Claude Code skill file to ~/.claude/skills/queue/SKILL.md."""
+    dest = Path.home() / ".claude" / "skills" / "queue" / "SKILL.md"
+    skill_src = Path(__file__).parent / "skills" / "queue" / "SKILL.md"
+
+    if not skill_src.exists():
+        print("Error: bundled SKILL.md not found in package installation.")
+        return 1
+
+    if dest.exists() and not args.force:
+        print(f"Skill already installed at {dest}")
+        print("Use --force to overwrite.")
+        return 1
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(skill_src.read_text(encoding="utf-8"), encoding="utf-8")
+    print(f"Skill installed to {dest}")
+    print("Restart Claude Code for the /queue skill to become available.")
+    return 0
 
 
 def cmd_prompt_box(args) -> int:

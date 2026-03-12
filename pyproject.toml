@@ -17,12 +17,13 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-mock"]
+eval = ["pytest", "pytest-mock", "anthropic>=0.40.0"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.package-data]
-claude_code_queue = ["py.typed"]
+claude_code_queue = ["py.typed", "skills/**/*"]
 
 
 [project.scripts]
