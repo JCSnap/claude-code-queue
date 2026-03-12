@@ -13,6 +13,7 @@ import sys
 from datetime import datetime
 
 from .queue_manager import QueueManager
+from .storage import QueueStorage
 from .models import QueuedPrompt, PromptStatus
 
 
@@ -49,7 +50,7 @@ Examples:
   # Cancel a prompt
   python -m claude_code_queue.cli cancel abc123
 
-  # Test Claude Code connection  
+  # Test Claude Code connection
   python -m claude_code_queue.cli test
         """,
     )
@@ -85,6 +86,16 @@ Examples:
     start_parser = subparsers.add_parser("start", help="Start the queue processor")
     start_parser.add_argument(
         "--verbose", "-v", action="store_true", help="Verbose output"
+    )
+    # SC1 — Allow operators to opt out of the global permissions bypass.
+    # The flag is on the 'start' subparser only; it is meaningless for subcommands
+    # that never invoke claude. Evaluating args.no_skip_permissions outside the
+    # 'start' branch would risk AttributeError.
+    start_parser.add_argument(
+        "--no-skip-permissions",
+        action="store_true",
+        default=False,
+        help="Do not pass --dangerously-skip-permissions to claude (requires confirmation dialogs)",
     )
 
     add_parser = subparsers.add_parser("add", help="Add a prompt to the queue")
@@ -168,29 +179,27 @@ Examples:
         return 1
 
     try:
-        manager = QueueManager(
-            storage_dir=args.storage_dir,
-            claude_command=args.claude_command,
-            check_interval=args.check_interval,
-            timeout=args.timeout,
-        )
-
+        # SC1+E3 — Dispatch without constructing a shared QueueManager upfront.
+        # Constructing QueueManager requires a live claude binary (_verify_claude_available).
+        # Commands that never invoke claude use QueueStorage directly, avoiding a
+        # spurious PATH dependency on the claude binary for everyday queue operations.
+        # cmd_start and cmd_test construct QueueManager internally.
         if args.command == "start":
-            return cmd_start(manager, args)
-        elif args.command == "add":
-            return cmd_add(manager, args)
-        elif args.command == "template":
-            return cmd_template(manager, args)
-        elif args.command == "status":
-            return cmd_status(manager, args)
-        elif args.command == "cancel":
-            return cmd_cancel(manager, args)
-        elif args.command == "list":
-            return cmd_list(manager, args)
+            return cmd_start(args)
         elif args.command == "test":
-            return cmd_test(manager, args)
+            return cmd_test(args)
+        elif args.command == "add":
+            return cmd_add(args)
+        elif args.command == "template":
+            return cmd_template(args)
+        elif args.command == "status":
+            return cmd_status(args)
+        elif args.command == "cancel":
+            return cmd_cancel(args)
+        elif args.command == "list":
+            return cmd_list(args)
         elif args.command == "bank":
-            return cmd_bank(manager, args)
+            return cmd_bank(args)
         elif args.command == "prompt-box":
             return cmd_prompt_box(args)
         else:
@@ -205,8 +214,15 @@ Examples:
         return 1
 
 
-def cmd_start(manager: QueueManager, args) -> int:
+def cmd_start(args) -> int:
     """Start the queue processor."""
+    manager = QueueManager(
+        storage_dir=args.storage_dir,
+        claude_command=args.claude_command,
+        check_interval=args.check_interval,
+        timeout=args.timeout,
+        skip_permissions=not args.no_skip_permissions,
+    )
 
     def status_callback(state):
         if args.verbose:
@@ -217,8 +233,9 @@ def cmd_start(manager: QueueManager, args) -> int:
     return 0
 
 
-def cmd_add(manager: QueueManager, args) -> int:
+def cmd_add(args) -> int:
     """Add a prompt to the queue."""
+    storage = QueueStorage(storage_dir=args.storage_dir)
     prompt = QueuedPrompt(
         content=args.prompt,
         working_directory=args.working_dir,
@@ -227,22 +244,31 @@ def cmd_add(manager: QueueManager, args) -> int:
         max_retries=args.max_retries,
         estimated_tokens=args.estimated_tokens,
     )
-
-    success = manager.add_prompt(prompt)
+    # Use _save_single_prompt directly rather than load_queue_state() +
+    # save_queue_state(). Loading the full queue state just to append one file
+    # is unnecessary: the daemon reloads all .md files on every tick anyway,
+    # so writing the file directly is sufficient. queue-state.json stores only
+    # aggregate counters (total_processed, failed_count) which are not affected
+    # by adding a new QUEUED prompt.
+    success = storage._save_single_prompt(prompt)
+    if success:
+        print(f"✓ Added prompt {prompt.id} to queue")
     return 0 if success else 1
 
 
-def cmd_template(manager: QueueManager, args) -> int:
+def cmd_template(args) -> int:
     """Create a prompt template file."""
-    file_path = manager.create_prompt_template(args.filename, args.priority)
+    storage = QueueStorage(storage_dir=args.storage_dir)
+    file_path = storage.create_prompt_template(args.filename, args.priority)
     print(f"Created template: {file_path}")
     print("Edit the file and it will be automatically picked up by the queue processor")
     return 0
 
 
-def cmd_status(manager: QueueManager, args) -> int:
+def cmd_status(args) -> int:
     """Show queue status."""
-    state = manager.get_status()
+    storage = QueueStorage(storage_dir=args.storage_dir)
+    state = storage.load_queue_state()
     stats = state.get_stats()
 
     if args.json:
@@ -296,15 +322,33 @@ def cmd_status(manager: QueueManager, args) -> int:
     return 0
 
 
-def cmd_cancel(manager: QueueManager, args) -> int:
+def cmd_cancel(args) -> int:
     """Cancel a prompt."""
-    success = manager.remove_prompt(args.prompt_id)
+    storage = QueueStorage(storage_dir=args.storage_dir)
+    state = storage.load_queue_state()
+    prompt = state.get_prompt(args.prompt_id)
+    if not prompt:
+        print(f"Prompt {args.prompt_id} not found")
+        return 1
+    if prompt.status == PromptStatus.EXECUTING:
+        print(f"Cannot remove executing prompt {args.prompt_id}")
+        return 1
+    prompt.status = PromptStatus.CANCELLED
+    prompt.add_log("Cancelled by user")
+    # Use _save_single_prompt directly: save_queue_state() would rewrite every
+    # prompt file in the queue (O(n) writes) just to cancel one entry.
+    # _save_single_prompt() writes exactly the changed file and moves it to the
+    # appropriate directory. The daemon reloads on the next tick anyway.
+    success = storage._save_single_prompt(prompt)
+    if success:
+        print(f"✓ Cancelled prompt {args.prompt_id}")
     return 0 if success else 1
 
 
-def cmd_list(manager: QueueManager, args) -> int:
+def cmd_list(args) -> int:
     """List prompts."""
-    state = manager.get_status()
+    storage = QueueStorage(storage_dir=args.storage_dir)
+    state = storage.load_queue_state()
     prompts = state.prompts
 
     if args.status:
@@ -355,14 +399,20 @@ def cmd_list(manager: QueueManager, args) -> int:
     return 0
 
 
-def cmd_test(manager: QueueManager, args) -> int:
+def cmd_test(args) -> int:
     """Test Claude Code connection."""
+    manager = QueueManager(
+        storage_dir=args.storage_dir,
+        claude_command=args.claude_command,
+        check_interval=args.check_interval,
+        timeout=args.timeout,
+    )
     is_working, message = manager.claude_interface.test_connection()
     print(message)
     return 0 if is_working else 1
 
 
-def cmd_bank(manager: QueueManager, args) -> int:
+def cmd_bank(args) -> int:
     """Handle bank subcommands."""
     if not args.bank_command:
         print("Error: No bank operation specified")
@@ -370,41 +420,43 @@ def cmd_bank(manager: QueueManager, args) -> int:
         return 1
 
     if args.bank_command == "save":
-        return cmd_bank_save(manager, args)
+        return cmd_bank_save(args)
     elif args.bank_command == "list":
-        return cmd_bank_list(manager, args)
+        return cmd_bank_list(args)
     elif args.bank_command == "use":
-        return cmd_bank_use(manager, args)
+        return cmd_bank_use(args)
     elif args.bank_command == "delete":
-        return cmd_bank_delete(manager, args)
+        return cmd_bank_delete(args)
     else:
         print(f"Unknown bank operation: {args.bank_command}")
         return 1
 
 
-def cmd_bank_save(manager: QueueManager, args) -> int:
+def cmd_bank_save(args) -> int:
     """Save a template to the bank."""
-    file_path = manager.save_prompt_to_bank(args.template_name, args.priority)
+    storage = QueueStorage(storage_dir=args.storage_dir)
+    file_path = storage.save_prompt_to_bank(args.template_name, args.priority)
     print(f"✓ Created template in bank: {file_path}")
     print(f"Edit {file_path} to customize your template")
     return 0
 
 
-def cmd_bank_list(manager: QueueManager, args) -> int:
+def cmd_bank_list(args) -> int:
     """List templates in the bank."""
-    templates = manager.list_bank_templates()
-    
+    storage = QueueStorage(storage_dir=args.storage_dir)
+    templates = storage.list_bank_templates()
+
     if args.json:
         print(json.dumps(templates, indent=2, default=str))
         return 0
-    
+
     if not templates:
         print("No templates found in bank")
         return 0
-    
+
     print(f"Found {len(templates)} template(s) in bank:")
     print("-" * 80)
-    
+
     for template in templates:
         print(f"📄 {template['name']}")
         print(f"   Title: {template['title']}")
@@ -414,51 +466,63 @@ def cmd_bank_list(manager: QueueManager, args) -> int:
             print(f"   Estimated tokens: {template['estimated_tokens']}")
         print(f"   Modified: {template['modified'].strftime('%Y-%m-%d %H:%M:%S')}")
         print()
-    
+
     return 0
 
 
-def cmd_bank_use(manager: QueueManager, args) -> int:
+def cmd_bank_use(args) -> int:
     """Use a template from the bank."""
-    success = manager.use_bank_template(args.template_name)
+    storage = QueueStorage(storage_dir=args.storage_dir)
+    prompt = storage.use_bank_template(args.template_name)
+    if not prompt:
+        print(f"Template '{args.template_name}' not found in bank")
+        return 1
+    success = storage._save_single_prompt(prompt)
+    if success:
+        print(f"✓ Added prompt {prompt.id} from template '{args.template_name}' to queue")
+    else:
+        print(f"✗ Failed to save prompt from template '{args.template_name}'")
     return 0 if success else 1
 
 
-def cmd_bank_delete(manager: QueueManager, args) -> int:
+def cmd_bank_delete(args) -> int:
     """Delete a template from the bank."""
-    success = manager.delete_bank_template(args.template_name)
+    storage = QueueStorage(storage_dir=args.storage_dir)
+    success = storage.delete_bank_template(args.template_name)
+    if success:
+        print(f"✓ Deleted template '{args.template_name}' from bank")
+    else:
+        print(f"✗ Template '{args.template_name}' not found in bank")
     return 0 if success else 1
 
 
 def cmd_prompt_box(args) -> int:
     """Launch the interactive prompt box CLI."""
     try:
-        # With setuptools-rust bins, the binary gets installed to the Python environment's bin directory
-        # We need to find it using shutil.which or check common locations
-        import shutil
-        
+        import shutil as _shutil
+
         binary_name = "prompt-box"
         if sys.platform == "win32":
             binary_name += ".exe"
-        
+
         # Try to find the binary in PATH first
-        binary_path = shutil.which(binary_name)
-        
+        binary_path = _shutil.which(binary_name)
+
         if not binary_path:
             # Fallback: check in the same directory as the Python executable
             python_bin_dir = os.path.dirname(sys.executable)
             potential_path = os.path.join(python_bin_dir, binary_name)
             if os.path.exists(potential_path):
                 binary_path = potential_path
-        
+
         if not binary_path or not os.path.exists(binary_path):
             print(f"Error: prompt-box binary not found. Please reinstall the package.")
             return 1
-        
+
         # Execute the Rust binary with all arguments
         result = subprocess.run([binary_path] + args.args, stdout=sys.stdout, stderr=sys.stderr)
         return result.returncode
-        
+
     except FileNotFoundError:
         print(f"Error: Could not execute prompt-box binary")
         return 1
