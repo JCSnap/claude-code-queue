@@ -388,7 +388,15 @@ class QueueManager:
             print(f"Warning: artifact cleanup failed: {e}")
 
     def _do_cleanup_rate_limit_artifacts(self, prompt: QueuedPrompt) -> None:
-        """Inner implementation — may raise; caller catches all exceptions."""
+        """Inner implementation — may raise; caller catches all exceptions.
+
+        IMPORTANT: This method relies on Claude Code's internal file layout under
+        ~/.claude/ (projects/, todos/, debug/, telemetry/). This is undocumented
+        internal structure that may change across Claude Code versions. If the
+        layout changes, cleanup will silently stop working (safe — no data loss).
+        The path encoding (resolved.replace("/", "-")) mirrors Claude Code's
+        current project directory naming convention.
+        """
         cutoff = prompt.last_executed.timestamp()
         claude_dir = Path.home() / ".claude"
         deleted = 0
