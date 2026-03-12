@@ -6,7 +6,7 @@ import json
 import re
 import shutil
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import List, Optional
 import yaml  # type: ignore
@@ -133,6 +133,9 @@ class MarkdownPromptParser:
                 reset_time=QueueStorage._parse_optional_datetime(
                     metadata.get("reset_time")
                 ),
+                retry_not_before=QueueStorage._parse_optional_datetime(
+                    metadata.get("retry_not_before")
+                ),
             )
 
             return prompt
@@ -164,6 +167,8 @@ class MarkdownPromptParser:
                 metadata["rate_limited_at"] = prompt.rate_limited_at.isoformat()
             if prompt.reset_time:
                 metadata["reset_time"] = prompt.reset_time.isoformat()
+            if prompt.retry_not_before is not None:
+                metadata["retry_not_before"] = prompt.retry_not_before.isoformat()
 
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write("---\n")
@@ -239,6 +244,18 @@ class QueueStorage:
         """
         if not val:
             return None
+        # Fast-path: PyYAML may return a native datetime object rather than a string
+        # when the YAML value matches the timestamp pattern (e.g. an unquoted isoformat).
+        # fromisoformat() requires a str; without this guard, the TypeError is silently
+        # swallowed by the except clause and the field is lost.
+        #
+        # ORDERING: datetime must be checked BEFORE date because datetime is a subclass
+        # of date — isinstance(datetime_obj, date) is True. Using elif makes this
+        # dependency explicit and prevents silent breakage if the checks are reordered.
+        if isinstance(val, datetime):
+            return val.replace(tzinfo=None)
+        elif isinstance(val, date):
+            return datetime.combine(val, datetime.min.time())
         try:
             if isinstance(val, str) and val.endswith("Z"):
                 val = val[:-1] + "+00:00"
@@ -308,6 +325,10 @@ class QueueStorage:
                 # Re-queue the prompt so it runs again on restart rather than
                 # leaving it permanently stuck in EXECUTING state.
                 prompt.status = PromptStatus.QUEUED
+                prompt.clear_retry_backoff()      # Fix 3: _execute_prompt() clears this before
+                                                 # writing .executing.md in normal operation, so
+                                                 # this guard should never fire. Included for
+                                                 # defensive completeness.
                 prompt.add_log("Recovered from interrupted execution (process restart)")
                 prompts.append(prompt)
                 processed_ids.add(prompt.id)
@@ -323,7 +344,6 @@ class QueueStorage:
             if (
                 file_path.name.endswith(".executing.md")
                 or file_path.name.endswith(".rate-limited.md")
-                or "#" in file_path.name
             ):
                 continue
 
@@ -402,7 +422,7 @@ class QueueStorage:
     @staticmethod
     def _sanitize_filename_static(text: str) -> str:
         """Sanitize text for use in filename (static version for use in parser)."""
-        invalid_chars = '<>:"/\\|?*'
+        invalid_chars = '<>:"/\\|?*#\'`'
         for char in invalid_chars:
             text = text.replace(char, "-")
 
@@ -419,6 +439,9 @@ class QueueStorage:
                 shutil.move(str(file_path), str(new_path))
 
             prompt.status = PromptStatus.QUEUED
+            prompt.clear_retry_backoff()     # Fix 3: clear so an imported file that happens to
+                                             # carry retry_not_before in its frontmatter doesn't
+                                             # silently block execution.
             return prompt
         return None
 
@@ -578,6 +601,7 @@ What should be delivered...
             template_prompt.last_executed = None
             template_prompt.rate_limited_at = None
             template_prompt.reset_time = None
+            template_prompt.clear_retry_backoff()
 
             return template_prompt
 

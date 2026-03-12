@@ -2,6 +2,8 @@
 Queue manager with execution loop.
 """
 
+import os
+import sys
 import time
 import signal
 from datetime import datetime, timedelta
@@ -22,6 +24,7 @@ class QueueManager:
         check_interval: int = 30,
         timeout: int = 3600,
         skip_permissions: bool = True,
+        generic_failure_retry_delay: int = 60,
     ):
         self.storage = QueueStorage(storage_dir)
         self.claude_interface = ClaudeCodeInterface(claude_command, timeout,
@@ -29,13 +32,26 @@ class QueueManager:
         self.check_interval = check_interval
         self.running = False
         self.state: Optional[QueueState] = None
+        if generic_failure_retry_delay < 1:
+            print(
+                f"Warning: generic_failure_retry_delay={generic_failure_retry_delay} "
+                f"clamped to 1 to prevent retry spin loops",
+                file=sys.stderr,
+            )
+        self._generic_failure_retry_delay = max(1, generic_failure_retry_delay)
 
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals."""
-        print(f"\nReceived signal {signum}, shutting down gracefully...")
+        # Signal-safe stderr write — avoids re-entering print()'s stream lock
+        # if the main thread is mid-print when the signal fires.
+        try:
+            os.write(2, f"\nReceived signal {signum}, shutting down gracefully...\n".encode())
+        except OSError:
+            pass
+        self.claude_interface.kill_current()  # unblocks communicate() if executing
         self.stop()
 
     def start(self, callback: Optional[Callable[[QueueState], None]] = None) -> None:
@@ -52,16 +68,35 @@ class QueueManager:
         self.state = self.storage.load_queue_state()
         print(f"✓ Loaded queue with {len(self.state.prompts)} prompts")
 
+        # Fix 3: warn about cooldown-blocked prompts so operators aren't confused
+        # when the queue appears stuck for up to 60 seconds after restart.
+        now = datetime.now()
+        cooldown_count = sum(
+            1 for p in self.state.prompts
+            if p.status == PromptStatus.QUEUED
+            and p.retry_not_before is not None
+            and now < p.retry_not_before
+        )
+        if cooldown_count:
+            soonest = min(
+                p.retry_not_before for p in self.state.prompts
+                if p.retry_not_before is not None and now < p.retry_not_before
+            )
+            wait = max(1, int((soonest - now).total_seconds()))
+            print(f"⏳ {cooldown_count} prompt(s) in retry cooldown (next eligible in {wait}s)")
+
         self.running = True
 
         try:
             while self.running:
-                self._process_queue_iteration(callback)
+                did_work = self._process_queue_iteration(callback)
 
-                if self.running:
+                if self.running and not did_work:
                     time.sleep(self.check_interval)
 
         except KeyboardInterrupt:
+            # print() is safe: we are in normal execution context, not signal-handler
+            # context.  The signal handler used os.write(2, ...) and has already returned.
             print("\nShutdown requested by user")
         except Exception as e:
             print(f"Error in queue processing: {e}")
@@ -74,11 +109,25 @@ class QueueManager:
 
     def _shutdown(self) -> None:
         """Clean shutdown procedure."""
+        # print() is safe here: _shutdown() runs from the finally block in start(),
+        # which is normal execution context (not signal-handler context).  The signal
+        # handler itself uses os.write(2, ...) to avoid stream-lock re-entrance.
         print("Shutting down...")
 
         if self.state:
             for prompt in self.state.prompts:
                 if prompt.status == PromptStatus.EXECUTING:
+                    # Invariant: _execute_prompt() must clear retry_not_before
+                    # in-memory before save_queue_state() writes .executing.md, so by the
+                    # time _shutdown() runs, retry_not_before is already None.
+                    if prompt.retry_not_before is not None:
+                        print(
+                            f"Warning: prompt {prompt.id} has stale "
+                            f"retry_not_before={prompt.retry_not_before} during shutdown "
+                            f"(expected None); clearing. Check call order in _execute_prompt().",
+                            file=sys.stderr,
+                        )
+                        prompt.clear_retry_backoff()
                     prompt.status = PromptStatus.QUEUED
                     prompt.add_log("Execution interrupted during shutdown")
 
@@ -89,8 +138,8 @@ class QueueManager:
 
     def _process_queue_iteration(
         self, callback: Optional[Callable[[QueueState], None]] = None
-    ) -> None:
-        """Process one iteration of the queue."""
+    ) -> bool:
+        """Process one iteration of the queue. Returns True if a prompt was executed."""
         previous_total_processed = self.state.total_processed if self.state else 0
         previous_failed_count = self.state.failed_count if self.state else 0
         previous_rate_limited_count = self.state.rate_limited_count if self.state else 0
@@ -117,7 +166,22 @@ class QueueManager:
                     f"Waiting for rate limit reset ({len(rate_limited_prompts)} prompts rate limited)"
                 )
             else:
-                print("No prompts in queue")
+                now = datetime.now()
+                cooldown_prompts = [
+                    p for p in self.state.prompts
+                    if p.status == PromptStatus.QUEUED
+                    and p.retry_not_before is not None
+                    and now < p.retry_not_before
+                ]
+                if cooldown_prompts:
+                    soonest = min(p.retry_not_before for p in cooldown_prompts)
+                    wait = max(0, (soonest - now).total_seconds())
+                    print(
+                        f"Waiting for retry cooldown ({len(cooldown_prompts)} prompt(s) in backoff, "
+                        f"next eligible in {max(1, int(wait))}s)"
+                    )
+                else:
+                    print("No prompts in queue")
 
             # Fix S8: _check_rate_limited_prompts() may have transitioned prompts to
             # FAILED. Save state so those transitions are persisted even when no prompt
@@ -126,7 +190,7 @@ class QueueManager:
 
             if callback:
                 callback(self.state)
-            return
+            return False
 
         print(f"Executing prompt {next_prompt.id}: {next_prompt.content[:50]}...")
         self._execute_prompt(next_prompt)
@@ -135,6 +199,7 @@ class QueueManager:
 
         if callback:
             callback(self.state)
+        return True
 
     def _check_rate_limited_prompts(self) -> None:
         """Check if any rate-limited prompts should be retried."""
@@ -158,16 +223,20 @@ class QueueManager:
 
             if prompt.can_retry():
                 prompt.status = PromptStatus.QUEUED
+                prompt.clear_retry_backoff()    # Fix 3: clear so the re-queued prompt is immediately
+                                                # selectable by get_next_prompt().
                 prompt.add_log("Retrying after rate limit cooldown")
                 print(f"✓ Prompt {prompt.id} ready for retry after cooldown")
             else:
                 prompt.status = PromptStatus.FAILED
+                prompt.clear_retry_backoff()    # Fix 3: clear stale field for YAML cleanliness
                 prompt.add_log(f"Max retries ({prompt.max_retries}) exceeded")
                 print(f"✗ Prompt {prompt.id} failed - max retries exceeded")
 
     def _execute_prompt(self, prompt: QueuedPrompt) -> None:
         """Execute a single prompt."""
         prompt.status = PromptStatus.EXECUTING
+        prompt.clear_retry_backoff()    # consumed; clear so it doesn't persist into .executing.md
         prompt.last_executed = datetime.now()
         retries_str = "∞" if prompt.max_retries == -1 else str(prompt.max_retries)
         prompt.add_log(
@@ -176,6 +245,9 @@ class QueueManager:
 
         self.storage.save_queue_state(self.state)
 
+        # execute_prompt() may raise KeyboardInterrupt (Ctrl+C path).
+        # _process_execution_result() is intentionally bypassed in that case;
+        # the prompt stays EXECUTING for _shutdown() to revert to QUEUED.
         result = self.claude_interface.execute_prompt(prompt)
 
         self._process_execution_result(prompt, result)
@@ -187,6 +259,7 @@ class QueueManager:
         execution_summary = f"Execution completed in {result.execution_time:.1f}s"
 
         if result.success:
+            # retry_not_before is already None — cleared by _execute_prompt() via clear_retry_backoff().
             prompt.status = PromptStatus.COMPLETED
             prompt.add_log(f"{execution_summary} - SUCCESS")
             if result.output:
@@ -194,6 +267,21 @@ class QueueManager:
 
             self.state.total_processed += 1
             print(f"✓ Prompt {prompt.id} completed successfully")
+
+        elif result.is_non_retryable:
+            # Fix B — Non-retryable error: fail immediately, skip retry counter and can_retry().
+            # Placing is_non_retryable before is_rate_limited in the chain ensures it always
+            # takes precedence; a check nested inside else: would be silently bypassed if both
+            # flags were ever set simultaneously.
+            prompt.status = PromptStatus.FAILED
+            prompt.clear_retry_backoff()    # Fix 3: clear stale field for YAML cleanliness
+            prompt.add_log(f"{execution_summary} - FAILED (non-retryable error, retry budget preserved)")
+            if result.error:
+                prompt.add_log(f"Error: {result.error}")
+            self.state.failed_count += 1
+            print(
+                f"✗ Prompt {prompt.id} failed permanently (non-retryable error, no retry)"
+            )
 
         elif result.is_rate_limited:
             # Fix S4: prompt.status is EXECUTING at this point — checking it against
@@ -215,7 +303,12 @@ class QueueManager:
 
             prompt.add_log(f"{execution_summary} - RATE LIMITED")
             if result.rate_limit_info and result.rate_limit_info.limit_message:
-                prompt.add_log(f"Message: {result.rate_limit_info.limit_message}")
+                source_tag = (
+                    " [via stdout]"
+                    if result.rate_limit_info.detection_source == "stdout"
+                    else ""
+                )
+                prompt.add_log(f"Message{source_tag}: {result.rate_limit_info.limit_message}")
 
             if not was_already_rate_limited and self.state is not None:
                 self.state.rate_limited_count += 1
@@ -226,21 +319,33 @@ class QueueManager:
 
             if prompt.can_retry():
                 prompt.status = PromptStatus.QUEUED
-                prompt.add_log(f"{execution_summary} - FAILED (will retry)")
+                # Fix 3 — Set retry_not_before so get_next_prompt() skips this prompt
+                # for self._generic_failure_retry_delay seconds, preventing a spin loop.
+                prompt.retry_not_before = datetime.now() + timedelta(
+                    seconds=self._generic_failure_retry_delay
+                )
+                prompt.add_log(
+                    f"{execution_summary} - FAILED "
+                    f"(will retry in {self._generic_failure_retry_delay}s)"
+                )
                 if result.error:
                     prompt.add_log(f"Error: {result.error}")
                 print(
-                    f"✗ Prompt {prompt.id} failed, will retry ({prompt.retry_count}/{prompt.max_retries})"
+                    f"✗ Prompt {prompt.id} failed, will retry in "
+                    f"{self._generic_failure_retry_delay}s "
+                    f"({prompt.retry_count}/{'∞' if prompt.max_retries == -1 else prompt.max_retries})"
                 )
             else:
                 prompt.status = PromptStatus.FAILED
+                prompt.clear_retry_backoff()    # Fix 3: clear stale field for YAML cleanliness
                 prompt.add_log(f"{execution_summary} - FAILED (max retries exceeded)")
                 if result.error:
                     prompt.add_log(f"Error: {result.error}")
 
                 self.state.failed_count += 1
+                retries_str = "∞" if prompt.max_retries == -1 else str(prompt.max_retries)
                 print(
-                    f"✗ Prompt {prompt.id} failed permanently after {prompt.max_retries} attempts"
+                    f"✗ Prompt {prompt.id} failed permanently after {retries_str} attempts"
                 )
 
         self.state.last_processed = datetime.now()

@@ -2,10 +2,14 @@
 Interface for executing prompts via Claude Code CLI.
 """
 
+import atexit
+import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -29,6 +33,51 @@ _RATE_LIMIT_MAX_RESET_HOURS = 24
 # CLI output this equals the byte count.
 _RATE_LIMIT_SCAN_CHARS = 2048
 
+# Only scan this many characters of stderr for non-retryable patterns.
+# The nested-session message is short (≤ ~200 chars) and appears near the top
+# of stderr. The cap mirrors the _RATE_LIMIT_SCAN_CHARS guard: it prevents a
+# subprocess tool whose verbose debug output happens to contain a matching phrase
+# from triggering a false positive. Set larger than _RATE_LIMIT_SCAN_CHARS (2 048)
+# because future non-retryable patterns may appear after longer preambles.
+_NON_RETRYABLE_SCAN_CHARS = 8192
+
+# Errors that are structurally permanent — retrying will never produce a different
+# outcome. When any of these substrings is found in the first _NON_RETRYABLE_SCAN_CHARS
+# characters of stderr (case-insensitive), the ExecutionResult is marked
+# is_non_retryable=True and _process_execution_result() will skip the retry logic
+# and immediately mark the prompt FAILED.
+#
+# Keep patterns specific enough to avoid false positives.
+_NON_RETRYABLE_PATTERNS = [
+    "claude code cannot be launched inside another claude code session",
+]
+
+# signal.SIGKILL is not defined on Windows (only POSIX).  Referencing it
+# directly (e.g., signal.SIGKILL) raises AttributeError on Windows.  This
+# constant provides the numeric value (9) on all platforms so callers never
+# need a getattr guard at every call site.  _kill_proc_group() already
+# handles the Windows fallback (proc.kill() instead of os.killpg).
+_SIGKILL = getattr(signal, "SIGKILL", 9)
+
+# signal.SIGTERM exists on both POSIX and Windows, but define it as a
+# module constant for symmetry with _SIGKILL and to allow tests to import
+# it alongside _SIGKILL without referencing the signal module directly.
+_SIGTERM = getattr(signal, "SIGTERM", 15)
+
+# Seconds to wait for the subprocess to exit after SIGTERM before
+# escalating to SIGKILL.  3 seconds balances responsiveness (user expects
+# fast Ctrl+C) with giving well-behaved processes time to clean up.
+# Most processes exit within 100ms of SIGTERM; 3s is generous.
+# Used by the daemon thread in kill_current().
+_KILL_ESCALATION_TIMEOUT_S = 3
+
+# Seconds to wait for the subprocess leader to exit after SIGKILL in the
+# except-TimeoutExpired handler.  SIGKILL is immediate (the only exception
+# is a process stuck in uninterruptible sleep / D state), so 2 seconds is
+# generous.  Caps the proc.wait() call so an unusual delay cannot block
+# the queue indefinitely.
+_DRAIN_TIMEOUT_S = 2
+
 
 class ClaudeCodeInterface:
     """Interface for executing prompts via Claude Code CLI."""
@@ -38,6 +87,16 @@ class ClaudeCodeInterface:
         self.claude_command = claude_command
         self.timeout = timeout
         self.skip_permissions = skip_permissions
+        self._current_process: Optional[subprocess.Popen] = None
+        self._interrupted: bool = False
+        self._escalate_thread: Optional[threading.Thread] = None
+
+        # Defense-in-depth: if the Python process exits without going through
+        # _signal_handler() or the except-BaseException cleanup, kill any
+        # still-running subprocess rather than leaving it orphaned.
+        self._atexit_handler = self._atexit_cleanup
+        atexit.register(self._atexit_handler)
+
         self._verify_claude_available()
 
     def _verify_claude_available(self) -> None:
@@ -52,11 +111,13 @@ class ClaudeCodeInterface:
                 if resolved:
                     self.claude_command = resolved
 
+            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
             result = subprocess.run(
                 [self.claude_command, "--version"],
                 capture_output=True,
                 text=True,
                 timeout=10,
+                env=subprocess_env,
             )
             if result.returncode != 0:
                 raise RuntimeError(f"Claude Code CLI not available: {result.stderr}")
@@ -73,7 +134,8 @@ class ClaudeCodeInterface:
                         f"Warning: claude {version_str!r} predates stderr-only rate-limit "
                         f"detection (threshold "
                         f"{'.'.join(str(x) for x in _STDERR_RATE_LIMIT_MIN_VERSION)}). "
-                        "Rate-limit messages written to stdout will be missed.",
+                        "On successful executions (returncode=0), rate-limit messages on "
+                        "stdout will be missed. Non-zero exits are covered by the stdout scan.",
                         file=sys.stderr,
                     )
 
@@ -83,6 +145,116 @@ class ClaudeCodeInterface:
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError("Claude Code CLI verification timed out.")
+
+    def _atexit_cleanup(self) -> None:
+        """Wrapper for atexit — survives interpreter shutdown.
+
+        During interpreter shutdown, module globals (``os``, ``signal``,
+        ``sys``) may already be set to ``None``.  This wrapper swallows
+        all exceptions so the shutdown sequence is never disrupted.
+        """
+        try:
+            self.kill_current()
+        except BaseException:
+            pass
+
+    def close(self) -> None:
+        """Unregister the atexit handler.
+
+        Call this when the ``ClaudeCodeInterface`` instance is no longer
+        needed (e.g., in test fixture teardown) to prevent atexit handlers
+        from accumulating across the process lifetime.  Safe to call
+        multiple times — ``atexit.unregister`` is a no-op if the callable
+        was never registered or was already unregistered.
+        """
+        atexit.unregister(self._atexit_handler)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    @staticmethod
+    def _kill_proc_group(proc: subprocess.Popen, sig: int) -> bool:
+        """Send *sig* to the subprocess's process group, or to the process
+        directly on Windows where ``os.killpg`` is absent.
+
+        INVARIANT: This method uses ``proc.pid`` as the PGID.  This is only
+        correct because ``execute_prompt()`` launches the subprocess with
+        ``start_new_session=True`` (POSIX), making the child a session leader
+        whose PID == PGID.
+
+        Returns ``True`` if the signal was sent successfully, ``False`` if the
+        process group was already gone (``OSError``).
+        """
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(proc.pid, sig)
+            else:
+                # Windows: no process-group kill; fall back to single-process.
+                if sig == _SIGKILL:
+                    proc.kill()
+                else:
+                    proc.terminate()
+            return True
+        except (OSError, AttributeError):
+            return False
+
+    def kill_current(self) -> None:
+        """Terminate the currently-running claude subprocess, if any.
+
+        Safe to call from a signal handler — returns immediately after
+        sending SIGTERM.  A daemon thread escalates to SIGKILL after
+        ``_KILL_ESCALATION_TIMEOUT_S`` seconds if the child has not exited.
+
+        NOTE: Uses ``os.write(2, ...)`` instead of ``print()`` to avoid
+        re-entering the stream lock if the main thread is mid-print.
+        """
+        proc = self._current_process
+
+        if proc is None:
+            return
+
+        # Signal-safe stderr write
+        try:
+            os.write(2, f"Terminating subprocess (pid={proc.pid})...\n".encode())
+        except OSError:
+            pass
+
+        if not self._kill_proc_group(proc, _SIGTERM):
+            return                    # process group already gone
+
+        self._interrupted = True
+
+        # Escalate to SIGKILL in a daemon thread so the signal handler
+        # returns immediately.
+        #
+        # Capture references as locals: during interpreter shutdown, module
+        # globals may already be None.
+        _kill = ClaudeCodeInterface._kill_proc_group
+        _sigkill = _SIGKILL
+        _escalation_timeout = _KILL_ESCALATION_TIMEOUT_S
+
+        def _escalate(p: subprocess.Popen) -> None:
+            try:
+                try:
+                    p.wait(timeout=_escalation_timeout)
+                    return
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.write(2, f"Subprocess (pid={p.pid}) ignored SIGTERM for "
+                                 f"{_escalation_timeout}s; escalating to SIGKILL\n".encode())
+                    except (OSError, AttributeError):
+                        pass
+                    _kill(p, _sigkill)
+            except BaseException:
+                pass
+
+        self._escalate_thread = threading.Thread(
+            target=_escalate, args=(proc,), daemon=True
+        )
+        self._escalate_thread.start()
 
     def execute_prompt(self, prompt: QueuedPrompt) -> ExecutionResult:
         """Execute a prompt via Claude Code CLI."""
@@ -137,9 +309,64 @@ class ClaudeCodeInterface:
             # E1 — Use cwd= instead of os.chdir() to set the subprocess working directory.
             # This is thread-safe: os.chdir() changes the entire process CWD, which breaks
             # concurrent executions and any other thread that relies on getcwd().
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=self.timeout,
-                cwd=str(working_dir)
+            # Fix A — Strip CLAUDECODE so nested claude invocations are not blocked by the
+            # anti-nesting guard. The rest of the environment (PATH, HOME, API keys, etc.)
+            # is preserved unchanged.
+            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
+            # Captures the interrupt flag across all exit paths — see finally block.
+            _was_interrupted = False
+
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,    # isolate from terminal SIGINT; also required by _kill_proc_group()
+                cwd=str(working_dir),
+                env=subprocess_env,
+            )
+            self._interrupted = False             # clear stale flag before registering proc
+            self._current_process = proc
+
+            try:
+                stdout, stderr = proc.communicate(timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                ClaudeCodeInterface._kill_proc_group(proc, _SIGKILL)
+                try:
+                    proc.wait(timeout=_DRAIN_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    pass
+                for _pipe in (proc.stdout, proc.stderr):
+                    if _pipe:
+                        try:
+                            _pipe.close()
+                        except OSError:
+                            pass
+                raise
+            except BaseException:
+                ClaudeCodeInterface._kill_proc_group(proc, _SIGKILL)
+                for _pipe in (proc.stdout, proc.stderr):
+                    if _pipe:
+                        try:
+                            _pipe.close()
+                        except OSError:
+                            pass
+                raise
+            finally:
+                self._current_process = None
+                _was_interrupted = self._interrupted
+                self._interrupted = False
+
+            if _was_interrupted:
+                raise KeyboardInterrupt
+
+            result = subprocess.CompletedProcess(
+                cmd,
+                proc.returncode,
+                stdout=stdout,
+                stderr=stderr,
             )
 
             execution_time = time.time() - start_time
@@ -148,8 +375,39 @@ class ClaudeCodeInterface:
             # Searching stdout causes false positives if Claude's response happens to
             # contain any trigger phrase (e.g., code that handles rate limits).
             # Caveat: if older versions of the `claude` CLI write rate-limit messages to
-            # stdout, this change will miss them (see _STDERR_RATE_LIMIT_MIN_VERSION).
+            # stdout on successful executions (returncode=0), this will miss them
+            # (see _STDERR_RATE_LIMIT_MIN_VERSION). For returncode != 0 exits, stdout
+            # is also scanned by the Fix 2 block below.
             rate_limit_info = self._detect_rate_limit(result.stderr)
+            is_non_retryable = self._detect_non_retryable_error(result.stderr)
+
+            # Fix 2 — Mid-execution rate-limit: when the process exits non-zero and
+            # stderr has no rate-limit pattern, also scan stdout.
+            # Rationale: a usage-limit hit during an active conversation causes the CLI
+            # to emit the notice on stdout (conversation stream) then exit non-zero.
+            # Scanning stdout is safe here because returncode != 0 is incompatible with
+            # a genuine successful Claude response, so no false positive can occur.
+            #
+            # IMPORTANT: scan the TAIL, not the head.
+            # _detect_rate_limit() internally applies output[:_RATE_LIMIT_SCAN_CHARS].
+            # For a long-running conversation (e.g. 62s), stdout begins with thousands
+            # of characters of conversation output; the rate-limit notice appears at the
+            # very end of the stream. Passing the tail ensures the scan window covers
+            # the error, not the start of the conversation.
+            if result.returncode != 0 and not rate_limit_info.is_rate_limited and result.stdout:
+                # broad_patterns=False: only stdout-safe patterns are used here.
+                # Unlike stderr (where genuine Claude CLI messages appear at the very
+                # start and the scan-window guards depth), the stdout tail can contain
+                # subprocess output that legitimately includes broad phrases like
+                # "rate limited", "too many requests", "quota exceeded",
+                # "rate_limit_error" (in user code), or "rate limit exceeded".
+                # Allowing them would turn a subprocess failure into a
+                # false-positive ~5-hour rate-limit hold.
+                stdout_tail = result.stdout[-_RATE_LIMIT_SCAN_CHARS:]
+                stdout_rate_limit_info = self._detect_rate_limit(stdout_tail, broad_patterns=False)
+                if stdout_rate_limit_info.is_rate_limited:
+                    stdout_rate_limit_info.detection_source = "stdout"
+                    rate_limit_info = stdout_rate_limit_info
 
             success = result.returncode == 0 and not rate_limit_info.is_rate_limited
 
@@ -159,6 +417,7 @@ class ClaudeCodeInterface:
                 error=result.stderr,
                 rate_limit_info=rate_limit_info,
                 execution_time=execution_time,
+                is_non_retryable=is_non_retryable,
             )
 
         except subprocess.TimeoutExpired:
@@ -170,6 +429,10 @@ class ClaudeCodeInterface:
                 execution_time=execution_time,
             )
         except Exception as e:
+            # If a signal-driven kill was requested but communicate() raised
+            # an exception instead of returning normally, treat as interrupt.
+            if _was_interrupted:
+                raise KeyboardInterrupt
             execution_time = time.time() - start_time
             return ExecutionResult(
                 success=False,
@@ -178,7 +441,11 @@ class ClaudeCodeInterface:
                 execution_time=execution_time,
             )
 
-    def _detect_rate_limit(self, output: str) -> RateLimitInfo:
+    def _detect_rate_limit(
+        self,
+        output: str,
+        broad_patterns: bool = True,  # True for stderr (common path); False for stdout scanning (Fix 2)
+    ) -> RateLimitInfo:
         """Detect rate limiting from Claude Code output."""
         # S11b: restrict pattern scan to the first _RATE_LIMIT_SCAN_CHARS characters.
         # Genuine rate-limit messages from the Claude CLI are short and always appear
@@ -188,16 +455,37 @@ class ClaudeCodeInterface:
         scan_window = output[:_RATE_LIMIT_SCAN_CHARS].lower()
 
         # S11a: 'limit exceeded' removed — too broad (matches Python tracebacks, shell
-        # ulimit errors, compiler output, etc.). Every meaningful Claude CLI rate-limit
-        # scenario is covered by the remaining four patterns.
-        # ASSUMPTION: the Claude CLI never uses bare "api limit exceeded" without a
-        # "rate", "quota", or "usage" qualifier. Re-verify if CLI output format changes.
+        # ulimit errors, compiler output, etc.). Re-verify if CLI output format changes.
+        # Fix 1: patterns split into stdout-safe and broad tiers. Stdout-safe patterns
+        # are specific to Anthropic messaging ("your" or pipe-delimited timestamp format);
+        # broad patterns are safe for stderr but risk false positives in stdout.
+        #
+        # Stdout-safe patterns — listed timestamp-extractor-first so that the richer
+        # _extract_reset_time_from_limit_message() fires before _estimate_reset_time()
+        # for any pattern that could theoretically match the same input.
         rate_limit_patterns = [
-            ("usage limit reached", self._extract_reset_time_from_limit_message),
-            ("rate limit exceeded", self._estimate_reset_time),
-            ("too many requests", self._estimate_reset_time),
-            ("quota exceeded", self._estimate_reset_time),
+            ("usage limit reached", self._extract_reset_time_from_limit_message),  # "usage limit reached|<ts>"
+            ("exceeded your rate limit", self._estimate_reset_time),  # "you have exceeded your rate limit"
+            ("reached your usage limit", self._estimate_reset_time),   # "you've/have reached your usage limit" (no apostrophe to avoid U+2019 mismatch)
         ]
+        # Broad patterns — safe for stderr (genuine Claude CLI messages appear at the
+        # very start; the scan-window provides depth protection) but NOT safe for
+        # stdout scanning, where subprocess output (npm, pip, curl, etc.) can
+        # legitimately contain these phrases, causing a false-positive ~5-hour hold.
+        #
+        # "rate limit exceeded" — HTTP 429 standard text; third-party APIs use it.
+        # "rate_limit_error" — Anthropic API type, but appears in user-generated code.
+        # "too many requests" — HTTP 429 status text; npm/pip/cloud CLIs print it.
+        # "quota exceeded" — GCP/AWS/Azure quota error messages use it.
+        # "rate limited" — common English phrase in network library output.
+        if broad_patterns:
+            rate_limit_patterns.extend([
+                ("rate limit exceeded", self._estimate_reset_time),
+                ("rate_limit_error", self._estimate_reset_time),       # Anthropic API machine-readable type
+                ("too many requests", self._estimate_reset_time),
+                ("quota exceeded", self._estimate_reset_time),
+                ("rate limited", self._estimate_reset_time),           # "you are rate limited"
+            ])
 
         for pattern, reset_extractor in rate_limit_patterns:
             if pattern in scan_window:
@@ -210,6 +498,20 @@ class ClaudeCodeInterface:
                 )
 
         return RateLimitInfo(is_rate_limited=False)
+
+    def _detect_non_retryable_error(self, stderr: str) -> bool:
+        """Return True if stderr contains a non-retryable error pattern.
+
+        Only the first _NON_RETRYABLE_SCAN_CHARS characters of stderr are scanned.
+        The nested-session message appears within the first ~200 chars, so the cap
+        never misses it; the cap does prevent long tool output from triggering false
+        positives if a future pattern is less specific.
+
+        Matching is case-insensitive: each pattern is lowercased at match time, so
+        entries in _NON_RETRYABLE_PATTERNS may be any case.
+        """
+        scan_window = stderr[:_NON_RETRYABLE_SCAN_CHARS].lower()
+        return any(pattern.lower() in scan_window for pattern in _NON_RETRYABLE_PATTERNS)
 
     def _extract_reset_time_from_limit_message(self, output: str) -> Optional[datetime]:
         """Extract reset time from Claude's limit message."""
@@ -291,11 +593,13 @@ class ClaudeCodeInterface:
     def test_connection(self) -> Tuple[bool, str]:
         """Test if Claude Code is working."""
         try:
+            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
             result = subprocess.run(
                 [self.claude_command, "--help"],
                 capture_output=True,
                 text=True,
                 timeout=10,
+                env=subprocess_env,
             )
 
             if result.returncode == 0:
@@ -313,11 +617,13 @@ class ClaudeCodeInterface:
     def get_available_commands(self) -> List[str]:
         """Get available Claude Code commands."""
         try:
+            subprocess_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
             result = subprocess.run(
                 [self.claude_command, "--help"],
                 capture_output=True,
                 text=True,
                 timeout=10,
+                env=subprocess_env,
             )
 
             if result.returncode == 0:
@@ -346,6 +652,13 @@ class ClaudeCodeInterface:
     def execute_simple_prompt(
         self, prompt_text: str, working_dir: str = "."
     ) -> ExecutionResult:
-        """Execute a simple prompt without full QueuedPrompt object."""
+        """Execute a simple prompt without full QueuedPrompt object.
+
+        Note: Ctrl+C kills the subprocess via the ``except BaseException``
+        cleanup, but does not revert the prompt to QUEUED (no ``_shutdown()``
+        exists in standalone usage).  For full Ctrl+C support with automatic
+        revert, use ``QueueManager`` which installs signal handlers that call
+        ``kill_current()``.
+        """
         simple_prompt = QueuedPrompt(content=prompt_text, working_directory=working_dir)
         return self.execute_prompt(simple_prompt)
