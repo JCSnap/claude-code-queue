@@ -13,7 +13,7 @@ from .storage import QueueStorage, MarkdownPromptParser
 from .claude_interface import ClaudeCodeInterface
 from .queue_manager import QueueManager
 
-__version__ = "0.1.0"
+__version__ = "0.4.1"
 __all__ = [
     "QueuedPrompt",
     "QueueState",

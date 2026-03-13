@@ -19,11 +19,15 @@ A tool to queue Claude Code prompts and automatically execute them when token li
 pip install claude-code-queue
 ```
 
-**Note**: The interactive `prompt-box` feature is compiled from Rust source at install
-time. If the [Rust toolchain](https://rustup.rs/) is not present when running
-`pip install`, the rest of `claude-code-queue` installs and works normally — only
-`claude-queue prompt-box` will be unavailable. To enable it later, install Rust and
-run `pip install --force-reinstall claude-code-queue`.
+**Optional Rust TUI**: The interactive `prompt-box` feature requires opting in at
+install time. To build it, you need the [Rust toolchain](https://rustup.rs/) and:
+
+```bash
+BUILD_RUST=1 pip install claude-code-queue
+```
+
+Without `BUILD_RUST=1`, the rest of `claude-code-queue` installs and works
+normally — only `claude-queue prompt-box` will be unavailable.
 
 **Linux only**: building `prompt-box` also requires X11 development headers
 (`libxcb-dev` on Debian/Ubuntu, `libxcb-devel` on Fedora/RHEL, `libxcb` on Arch).

@@ -1,12 +1,18 @@
+import os
 import shutil
 import sys
 from setuptools import setup
-from setuptools_rust import RustBin
 
 
 def _rust_extensions():
-    if shutil.which("cargo") is None:
+    if not os.environ.get("BUILD_RUST"):
         return []
+
+    if shutil.which("cargo") is None:
+        print("WARNING: BUILD_RUST=1 set but cargo not found. Skipping Rust build.")
+        return []
+
+    from setuptools_rust import RustBin
 
     if sys.platform.startswith("linux"):
         print(
