@@ -304,6 +304,9 @@ class ClaudeCodeInterface:
                 if context_refs:
                     full_prompt = f"{' '.join(context_refs)} {prompt.content}"
 
+            if prompt.model is not None:
+                cmd.extend(["--model", prompt.model])
+
             cmd.append(full_prompt)
 
             # E1 — Use cwd= instead of os.chdir() to set the subprocess working directory.
