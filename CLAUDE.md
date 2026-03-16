@@ -157,6 +157,7 @@ working_directory: .     # Execution CWD (resolved relative)
 context_files: []        # Files passed as @-references
 max_retries: 3           # Total attempts (1=no retry, -1=unlimited)
 estimated_tokens: null   # Optional hint
+model: null              # Optional Claude model ID (e.g. claude-haiku-4-5-20251001)
 # Internal fields (managed by the queue, not user-edited):
 status: queued
 retry_count: 0
@@ -173,7 +174,7 @@ retry_not_before: null
 | Command | Purpose | Needs `claude` binary? |
 |---|---|---|
 | `start [--verbose] [--no-skip-permissions]` | Run queue loop | Yes |
-| `add <prompt> [-p priority]` | Quick-add prompt | No |
+| `add <prompt> [-p priority] [-m model]` | Quick-add prompt | No |
 | `template <name> [-p priority]` | Create template .md | No |
 | `status [--json] [--detailed]` | Queue stats | No |
 | `list [--status <s>] [--json]` | List prompts | No |
