@@ -386,6 +386,109 @@ def test_parse_estimated_tokens_null(tmp_path):  # STO-023
     assert prompt.estimated_tokens is None
 
 
+def test_parse_reads_model(tmp_path):  # STO-065
+    """model: claude-haiku-4-5-20251001 in frontmatter → prompt.model == that string."""
+    storage = QueueStorage(str(tmp_path))
+    file_path = storage.queue_dir / "abc12345-task.md"
+    file_path.write_text(
+        "---\npriority: 0\nworking_directory: .\nmax_retries: 3\n"
+        "model: claude-haiku-4-5-20251001\n"
+        "status: queued\nretry_count: 0\ncreated_at: 2025-01-01T00:00:00\n---\n\ncontent"
+    )
+    prompt = storage.parser.parse_prompt_file(file_path)
+    assert prompt is not None
+    assert prompt.model == "claude-haiku-4-5-20251001"
+
+
+def test_parse_model_null(tmp_path):  # STO-066
+    """model: null in frontmatter → prompt.model is None."""
+    storage = QueueStorage(str(tmp_path))
+    file_path = storage.queue_dir / "abc12345-task.md"
+    file_path.write_text(
+        "---\npriority: 0\nworking_directory: .\nmax_retries: 3\n"
+        "model: null\n"
+        "status: queued\nretry_count: 0\ncreated_at: 2025-01-01T00:00:00\n---\n\ncontent"
+    )
+    prompt = storage.parser.parse_prompt_file(file_path)
+    assert prompt is not None
+    assert prompt.model is None
+
+
+def test_parse_model_coerces_bool_to_string(tmp_path):  # STO-067
+    """model: true in YAML → str coercion → prompt.model == 'True' (R7)."""
+    storage = QueueStorage(str(tmp_path))
+    file_path = storage.queue_dir / "abc12345-task.md"
+    file_path.write_text(
+        "---\npriority: 0\nworking_directory: .\nmax_retries: 3\n"
+        "model: true\n"
+        "status: queued\nretry_count: 0\ncreated_at: 2025-01-01T00:00:00\n---\n\ncontent"
+    )
+    prompt = storage.parser.parse_prompt_file(file_path)
+    assert prompt is not None
+    assert prompt.model == "True"
+
+
+def test_parse_model_coerces_int_to_string(tmp_path):  # STO-068
+    """model: 42 in YAML → str coercion → prompt.model == '42' (R7)."""
+    storage = QueueStorage(str(tmp_path))
+    file_path = storage.queue_dir / "abc12345-task.md"
+    file_path.write_text(
+        "---\npriority: 0\nworking_directory: .\nmax_retries: 3\n"
+        "model: 42\n"
+        "status: queued\nretry_count: 0\ncreated_at: 2025-01-01T00:00:00\n---\n\ncontent"
+    )
+    prompt = storage.parser.parse_prompt_file(file_path)
+    assert prompt is not None
+    assert prompt.model == "42"
+
+
+def test_model_roundtrip_write_then_parse(tmp_path):  # STO-069
+    """model survives write_prompt_file → parse_prompt_file round-trip."""
+    storage = QueueStorage(str(tmp_path))
+    prompt = QueuedPrompt(id="abc12345", content="task", model="claude-opus-4-6")
+    file_path = storage.queue_dir / "abc12345-task.md"
+    storage.parser.write_prompt_file(prompt, file_path)
+    parsed = storage.parser.parse_prompt_file(file_path)
+    assert parsed is not None
+    assert parsed.model == "claude-opus-4-6"
+
+
+def test_model_none_roundtrip_write_then_parse(tmp_path):  # STO-070
+    """model=None survives write → parse round-trip (field omitted from YAML)."""
+    storage = QueueStorage(str(tmp_path))
+    prompt = QueuedPrompt(id="abc12345", content="task", model=None)
+    file_path = storage.queue_dir / "abc12345-task.md"
+    storage.parser.write_prompt_file(prompt, file_path)
+    parsed = storage.parser.parse_prompt_file(file_path)
+    assert parsed is not None
+    assert parsed.model is None
+
+
+def test_create_prompt_template_includes_model_field(tmp_path):  # STO-071
+    """create_prompt_template() output includes 'model: null' in frontmatter."""
+    storage = QueueStorage(str(tmp_path))
+    file_path = storage.create_prompt_template("my-task")
+    content = file_path.read_text()
+    assert "model: null" in content
+
+
+def test_save_prompt_to_bank_includes_model_field(tmp_path):  # STO-072
+    """save_prompt_to_bank() output includes 'model: null' in frontmatter."""
+    storage = QueueStorage(str(tmp_path))
+    file_path = storage.save_prompt_to_bank("my-template")
+    content = file_path.read_text()
+    assert "model: null" in content
+
+
+def test_bank_list_includes_model_key(tmp_path):  # STO-073
+    """list_bank_templates() dicts include a 'model' key."""
+    storage = QueueStorage(str(tmp_path))
+    storage.save_prompt_to_bank("my-template")
+    templates = storage.list_bank_templates()
+    assert len(templates) == 1
+    assert "model" in templates[0]
+
+
 def test_parse_defaults_when_keys_missing(tmp_path):  # STO-024
     """Minimal frontmatter → defaults: priority=0, max_retries=3, context_files=[],
     estimated_tokens=None.

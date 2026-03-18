@@ -55,6 +55,7 @@ def _make_template(
     priority=0,
     working_directory=".",
     estimated_tokens=None,
+    model=None,
     modified=None,
 ):
     """Build a bank-template dict like QueueStorage returns."""
@@ -66,6 +67,7 @@ def _make_template(
         "priority": priority,
         "working_directory": working_directory,
         "estimated_tokens": estimated_tokens,
+        "model": model,
         "modified": modified,
     }
 
@@ -232,6 +234,21 @@ class TestAddCommand:
         _, storage = self._run_add()
         prompt = storage._save_single_prompt.call_args[0][0]
         assert prompt.estimated_tokens is None
+
+    def test_add_model_long_flag(self):
+        _, storage = self._run_add("--model", "claude-haiku-4-5-20251001")
+        prompt = storage._save_single_prompt.call_args[0][0]
+        assert prompt.model == "claude-haiku-4-5-20251001"
+
+    def test_add_model_short_flag(self):
+        _, storage = self._run_add("-m", "claude-sonnet-4-6")
+        prompt = storage._save_single_prompt.call_args[0][0]
+        assert prompt.model == "claude-sonnet-4-6"
+
+    def test_add_default_model_none(self):
+        _, storage = self._run_add()
+        prompt = storage._save_single_prompt.call_args[0][0]
+        assert prompt.model is None
 
     def test_add_returns_zero_on_success(self):
         code, _ = self._run_add(success=True)
@@ -703,6 +720,14 @@ class TestBankListCommand:
     def test_bank_list_omits_estimated_tokens_when_none(self, capsys):
         self._run_bank_list(templates=[_make_template(estimated_tokens=None)])
         assert "Estimated tokens" not in capsys.readouterr().out
+
+    def test_bank_list_shows_model_when_set(self, capsys):
+        self._run_bank_list(templates=[_make_template(model="claude-haiku-4-5-20251001")])
+        assert "claude-haiku-4-5-20251001" in capsys.readouterr().out
+
+    def test_bank_list_omits_model_when_none(self, capsys):
+        self._run_bank_list(templates=[_make_template(model=None)])
+        assert "Model:" not in capsys.readouterr().out
 
     def test_bank_list_shows_modified_timestamp(self, capsys):
         mod = datetime(2026, 3, 1, 10, 30, 0)
