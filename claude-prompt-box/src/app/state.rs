@@ -98,6 +98,16 @@ impl AppState {
         }
     }
 
+    /// Delete the word before the cursor (Option+Delete / Alt+Backspace)
+    pub fn delete_word_back(&mut self) {
+        if self.cursor == 0 || self.input.is_empty() {
+            return;
+        }
+        let word_start = self.find_prev_word_boundary(self.cursor);
+        self.input.drain(word_start..self.cursor);
+        self.cursor = word_start;
+    }
+
     pub fn delete_char_forward(&mut self) {
         if self.cursor < self.input.len() {
             self.input.remove(self.cursor);
@@ -225,5 +235,41 @@ impl AppState {
             .find(|(idx, _)| *idx > pos)
             .map(|(idx, _)| idx)
             .unwrap_or(self.input.len())
+    }
+
+    /// Find the start of the previous word (for word-by-word deletion).
+    /// Skips whitespace/punctuation first, then skips the word characters.
+    fn find_prev_word_boundary(&self, pos: usize) -> usize {
+        let chars: Vec<(usize, char)> = self.input.char_indices().collect();
+
+        // Find the index in chars vec that corresponds to our byte position
+        let mut char_idx = chars.len();
+        for (i, (byte_idx, _)) in chars.iter().enumerate() {
+            if *byte_idx >= pos {
+                char_idx = i;
+                break;
+            }
+        }
+
+        if char_idx == 0 {
+            return 0;
+        }
+
+        // Skip trailing whitespace/punctuation backwards
+        let mut i = char_idx;
+        while i > 0 && !chars[i - 1].1.is_alphanumeric() && chars[i - 1].1 != '_' {
+            i -= 1;
+        }
+
+        // Skip word characters backwards
+        while i > 0 && (chars[i - 1].1.is_alphanumeric() || chars[i - 1].1 == '_') {
+            i -= 1;
+        }
+
+        if i < chars.len() {
+            chars[i].0
+        } else {
+            0
+        }
     }
 }

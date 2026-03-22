@@ -37,9 +37,13 @@ fn handle_input_mode(
             }
         }
         KeyCode::Backspace => {
-            app.delete_char();
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                app.delete_word_back();
+            } else {
+                app.delete_char();
+            }
             app.status_message = None;
-            
+
             if is_in_at_token(app) {
                 trigger_picker_if_needed(app, fuzzy_matcher);
             }
@@ -67,7 +71,11 @@ fn handle_input_mode(
             app.history_next();
         }
         KeyCode::Enter => {
-            app.submit_input();
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                app.insert_char('\n');
+            } else {
+                app.submit_input();
+            }
         }
         KeyCode::Tab => {
             if is_in_at_token(app) {
@@ -113,7 +121,11 @@ fn handle_picker_mode(
             update_picker_search(app, fuzzy_matcher);
         }
         KeyCode::Backspace => {
-            app.delete_char();
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                app.delete_word_back();
+            } else {
+                app.delete_char();
+            }
             update_picker_search(app, fuzzy_matcher);
         }
         _ => {}

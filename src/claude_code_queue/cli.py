@@ -740,6 +740,15 @@ def cmd_prompt_box(args) -> int:
             if os.path.exists(potential_path):
                 binary_path = potential_path
 
+        if not binary_path:
+            # Fallback: check the Cargo build output relative to this package
+            pkg_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            for profile in ("release", "debug"):
+                potential_path = os.path.join(pkg_dir, "claude-prompt-box", "target", profile, binary_name)
+                if os.path.exists(potential_path):
+                    binary_path = potential_path
+                    break
+
         if not binary_path or not os.path.exists(binary_path):
             print(
                 "Error: prompt-box binary not found.\n"
