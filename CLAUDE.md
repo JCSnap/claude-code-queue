@@ -6,7 +6,7 @@ Queue Claude Code prompts and execute them automatically when token limits reset
 Markdown-based persistent queue with YAML frontmatter, automatic rate-limit
 detection, priority scheduling, and retry logic.
 
-**Version**: 0.4.2
+**Version**: 0.4.3
 **Python**: >=3.8
 **Only runtime dependency**: PyYAML >= 6.0
 **Entry point**: `claude-queue` (console script via `claude_code_queue.cli:main`)
