@@ -35,6 +35,7 @@ class QueuedPrompt:
     status: PromptStatus = PromptStatus.QUEUED
     execution_log: str = ""
     estimated_tokens: Optional[int] = None
+    model: Optional[str] = None
     last_executed: Optional[datetime] = None
     rate_limited_at: Optional[datetime] = None
     reset_time: Optional[datetime] = None
