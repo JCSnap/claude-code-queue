@@ -246,6 +246,22 @@ class QueueState:
 
 
 @dataclass
+class SessionStats:
+    """Token usage statistics extracted from a session's JSONL log."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    api_turns: int = 0
+
+    @property
+    def total_input_tokens(self) -> int:
+        """Total tokens billed as input (non-cached + cache-write + cache-read)."""
+        return self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens
+
+
+@dataclass
 class ExecutionResult:
     """Result of executing a prompt."""
 
