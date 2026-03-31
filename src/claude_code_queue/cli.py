@@ -239,10 +239,16 @@ Examples:
 
     # Install skill subcommand
     install_skill_parser = subparsers.add_parser(
-        "install-skill", help="Install the Claude Code skill to ~/.claude/skills/"
+        "install-skill", help="Install Claude Code skills to ~/.claude/skills/"
     )
     install_skill_parser.add_argument(
-        "--force", action="store_true", help="Overwrite existing skill file"
+        "--force", action="store_true", help="Overwrite existing skill files"
+    )
+    install_skill_parser.add_argument(
+        "skill_name",
+        nargs="?",
+        default=None,
+        help="Install a specific skill (e.g. 'queue', 'batch-wizard'). Installs all if omitted.",
     )
 
     # Cleanup subcommand
@@ -719,23 +725,35 @@ def cmd_batch_variables(args) -> int:
 
 
 def cmd_install_skill(args) -> int:
-    """Install the Claude Code skill file to ~/.claude/skills/queue/SKILL.md."""
-    dest = Path.home() / ".claude" / "skills" / "queue" / "SKILL.md"
-    skill_src = Path(__file__).parent / "skills" / "queue" / "SKILL.md"
+    """Install Claude Code skill files to ~/.claude/skills/."""
+    skills_pkg_dir = Path(__file__).parent / "skills"
+    available = [d.name for d in skills_pkg_dir.iterdir() if d.is_dir() and (d / "SKILL.md").exists()]
 
-    if not skill_src.exists():
-        print("Error: bundled SKILL.md not found in package installation.")
+    if args.skill_name:
+        if args.skill_name not in available:
+            print(f"Error: unknown skill '{args.skill_name}'. Available: {', '.join(sorted(available))}")
+            return 1
+        to_install = [args.skill_name]
+    else:
+        to_install = sorted(available)
+
+    errors = 0
+    for name in to_install:
+        skill_src = skills_pkg_dir / name / "SKILL.md"
+        dest = Path.home() / ".claude" / "skills" / name / "SKILL.md"
+
+        if dest.exists() and not args.force:
+            print(f"  Skill '{name}' already installed at {dest} (use --force to overwrite)")
+            errors += 1
+            continue
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(skill_src.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"  Installed '{name}' to {dest}")
+
+    if errors:
         return 1
-
-    if dest.exists() and not args.force:
-        print(f"Skill already installed at {dest}")
-        print("Use --force to overwrite.")
-        return 1
-
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(skill_src.read_text(encoding="utf-8"), encoding="utf-8")
-    print(f"Skill installed to {dest}")
-    print("Restart Claude Code for the /queue skill to become available.")
+    print("Restart Claude Code for skills to become available.")
     return 0
 
 

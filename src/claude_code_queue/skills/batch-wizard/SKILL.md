@@ -8,7 +8,6 @@ description: >
   Triggers on: "create a batch", "design queue jobs", "batch wizard",
   "plan a batch run", "generate jobs for", "queue a bunch of",
   "batch workflow".
-allowed-tools: [Bash, Read, Glob, Grep, Write, Edit, Agent]
 argument-hint: "[project path or short description of the work]"
 disable-model-invocation: false
 ---
@@ -140,7 +139,7 @@ Goal: Set the YAML frontmatter values for the batch.
 Goal: Write the template and CSV, validate, and preview before committing.
 
 - Write the template to `~/.claude-queue/bank/<name>.md`
-- Write the CSV alongside it or to a temp location.
+- Write the CSV to `~/.claude-queue/bank/<name>.csv`
 - Run: `claude-queue batch validate <name> --data <csv>`
 - Run: `claude-queue batch generate <name> --data <csv> --base-priority <N> [--priority-step <S>] --dry-run`
 - Show the dry-run output for review.
@@ -191,8 +190,9 @@ follow conventional commits".
 
 > Can these jobs run in parallel, or does one job's output affect another?
 
-`claude-queue` currently executes one job at a time, but this may change
-in the future. Even with serial execution, consider:
+`claude-queue` currently executes one job at a time. If parallel
+execution is added later, dependency issues become critical. Even with
+serial execution, consider:
 - Does job N modify a file that job N+1 also reads? (merge conflicts)
 - Does job order matter? (e.g., creating an interface before implementing it)
 - Should certain jobs be grouped at a higher priority to run first?
@@ -269,8 +269,8 @@ Goal: Final review and optional queue start.
 
 - Run: `claude-queue batch generate <name> --data <csv> --base-priority <N> [--priority-step <S>]`
 - Run: `claude-queue status --detailed` — show what will execute.
-- Report: total job count, estimated run time (based on ~1-2 min/job for
-  typical prompts), priority ordering.
+- Report: total job count, estimated run time (based on ~1-3 min/job for
+  typical prompts, longer for complex multi-file tasks), priority ordering.
 - Ask: Ready to start? Or do you want to review individual job files first?
 - If the user says go: `claude-queue start`
 - Remind the user they can monitor progress with `claude-queue status`
