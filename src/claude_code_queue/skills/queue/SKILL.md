@@ -99,7 +99,7 @@ Use 4-digit padding for batches under 10,000 jobs.
 
 | Field | Notes |
 |---|---|
-| `priority` | Lower number executes first. For batches, match to the filename prefix. |
+| `priority` | Lower number executes first (0 = highest). For batches, match to the filename prefix. |
 | `working_directory` | Absolute path. Use the actual project path from context. |
 | `context_files` | Paths relative to `working_directory`. Only include files that exist. |
 | `max_retries` | Total attempts: `3` = 3 total, `-1` = unlimited, `1` = no retry. Rate-limit retries and failures share this counter. |
