@@ -8,7 +8,6 @@ description: >
   automatically with retry. Triggers on: "queue this", "add to queue",
   "run later", "rate limit", "prompt bank", "save as template",
   "batch of tasks", "claude-queue".
-allowed-tools: [Bash, Read, Glob]
 argument-hint: "[task description or subcommand]"
 disable-model-invocation: false
 ---
@@ -79,11 +78,28 @@ Background, constraints, or requirements.
 What should be delivered when done.
 ```
 
+### Filename Convention
+
+Template filenames **must** start with a unique alphanumeric prefix
+(the prompt ID), followed by a `-` and a descriptive name. The prompt
+ID is everything before the first `-` in the filename.
+
+When creating batches of jobs, use zero-padded numeric prefixes that
+match the `priority` field so that `ls` order equals execution order:
+
+```
+0001-Fix-auth-bug.md          # priority: 1, runs first
+0002-Add-logging.md           # priority: 2, runs second
+0003-Update-tests.md          # priority: 3, runs third
+```
+
+Use 4-digit padding for batches under 10,000 jobs.
+
 ### Frontmatter Fields
 
 | Field | Notes |
 |---|---|
-| `priority` | **0 = highest**. Lower number executes first. |
+| `priority` | Lower number executes first. For batches, match to the filename prefix. |
 | `working_directory` | Absolute path. Use the actual project path from context. |
 | `context_files` | Paths relative to `working_directory`. Only include files that exist. |
 | `max_retries` | Total attempts: `3` = 3 total, `-1` = unlimited, `1` = no retry. Rate-limit retries and failures share this counter. |
@@ -177,3 +193,15 @@ reruns on restart. Prompt users to design queued tasks to be idempotent
 
 **Always suggest** running `claude-queue status --detailed` before starting
 the daemon so the user can review what will execute.
+
+## Recommended Shell Aliases
+
+Add these to `~/.bashrc` or `~/.zshrc` for convenient queue monitoring:
+
+```bash
+# Watch the queue directory (see jobs arrive, execute, and disappear)
+alias wQueue='pushd $HOME/.claude-queue/queue; watch ls'
+
+# Watch queue daemon state (current job, retry status, etc.)
+alias wqStat='watch cat $HOME/.claude-queue/queue-state.json'
+```
