@@ -12,6 +12,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import List
 
 from .batch import (
     extract_variables,
@@ -139,6 +140,9 @@ Examples:
     add_parser.add_argument(
         "--estimated-tokens", "-t", type=int, help="Estimated token usage"
     )
+    add_parser.add_argument(
+        "--model", "-m", default=None, help="Claude model ID (e.g. claude-haiku-4-5-20251001)"
+    )
 
     template_parser = subparsers.add_parser(
         "template", help="Create a prompt template file"
@@ -235,10 +239,25 @@ Examples:
 
     # Install skill subcommand
     install_skill_parser = subparsers.add_parser(
-        "install-skill", help="Install the Claude Code skill to ~/.claude/skills/"
+        "install-skill", help="Install Claude Code skills to ~/.claude/skills/"
     )
     install_skill_parser.add_argument(
-        "--force", action="store_true", help="Overwrite existing skill file"
+        "--force", action="store_true", help="Overwrite existing skill files"
+    )
+    install_skill_parser.add_argument(
+        "skill_name",
+        nargs="?",
+        default=None,
+        help="Install a specific skill (e.g. 'queue', 'batch-wizard'). Installs all if omitted.",
+    )
+
+    # Cleanup subcommand
+    cleanup_parser = subparsers.add_parser(
+        "cleanup", help="Remove rate-limit artifacts from ~/.claude/"
+    )
+    cleanup_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Report what would be deleted without acting",
     )
 
     # Prompt box subcommand
@@ -279,6 +298,8 @@ Examples:
             return cmd_batch(args)
         elif args.command == "install-skill":
             return cmd_install_skill(args)
+        elif args.command == "cleanup":
+            return cmd_cleanup(args)
         elif args.command == "prompt-box":
             return cmd_prompt_box(args)
         else:
@@ -322,6 +343,7 @@ def cmd_add(args) -> int:
         context_files=args.context_files,
         max_retries=args.max_retries,
         estimated_tokens=args.estimated_tokens,
+        model=args.model,
     )
     # Use _save_single_prompt directly rather than load_queue_state() +
     # save_queue_state(). Loading the full queue state just to append one file
@@ -543,6 +565,8 @@ def cmd_bank_list(args) -> int:
         print(f"   Working directory: {template['working_directory']}")
         if template['estimated_tokens']:
             print(f"   Estimated tokens: {template['estimated_tokens']}")
+        if template.get('model'):
+            print(f"   Model: {template['model']}")
         print(f"   Modified: {template['modified'].strftime('%Y-%m-%d %H:%M:%S')}")
         print()
 
@@ -701,23 +725,123 @@ def cmd_batch_variables(args) -> int:
 
 
 def cmd_install_skill(args) -> int:
-    """Install the Claude Code skill file to ~/.claude/skills/queue/SKILL.md."""
-    dest = Path.home() / ".claude" / "skills" / "queue" / "SKILL.md"
-    skill_src = Path(__file__).parent / "skills" / "queue" / "SKILL.md"
+    """Install Claude Code skill files to ~/.claude/skills/."""
+    skills_pkg_dir = Path(__file__).parent / "skills"
+    available = [d.name for d in skills_pkg_dir.iterdir() if d.is_dir() and (d / "SKILL.md").exists()]
 
-    if not skill_src.exists():
-        print("Error: bundled SKILL.md not found in package installation.")
+    if args.skill_name:
+        if args.skill_name not in available:
+            print(f"Error: unknown skill '{args.skill_name}'. Available: {', '.join(sorted(available))}")
+            return 1
+        to_install = [args.skill_name]
+    else:
+        to_install = sorted(available)
+
+    errors = 0
+    for name in to_install:
+        skill_src = skills_pkg_dir / name / "SKILL.md"
+        dest = Path.home() / ".claude" / "skills" / name / "SKILL.md"
+
+        if dest.exists() and not args.force:
+            print(f"  Skill '{name}' already installed at {dest} (use --force to overwrite)")
+            errors += 1
+            continue
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(skill_src.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"  Installed '{name}' to {dest}")
+
+    if errors:
         return 1
+    print("Restart Claude Code for skills to become available.")
+    return 0
 
-    if dest.exists() and not args.force:
-        print(f"Skill already installed at {dest}")
-        print("Use --force to overwrite.")
-        return 1
 
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(skill_src.read_text(encoding="utf-8"), encoding="utf-8")
-    print(f"Skill installed to {dest}")
-    print("Restart Claude Code for the /queue skill to become available.")
+def cmd_cleanup(args) -> int:
+    """Remove rate-limit artifacts from ~/.claude/.
+
+    Primary identification: scan debug transcripts for 'rate_limit_error' in
+    the content (authoritative signal).  Then delete correlated JSONL, todo,
+    and telemetry files by UUID.
+
+    This is the E3 pattern: no claude binary needed.
+    """
+    claude_dir = Path.home() / ".claude"
+    dry_run = args.dry_run
+    matched = 0
+    skipped = 0
+    rate_limited_uuids: List[str] = []
+
+    # 1. Debug transcripts — primary identification via content grep.
+    #    Read the full file (max ~90 KB for successful runs) since this is a
+    #    one-time tool where correctness matters more than speed.
+    debug_dir = claude_dir / "debug"
+    if debug_dir.is_dir():
+        for debug_file in debug_dir.glob("*.txt"):
+            try:
+                with open(debug_file, "r", errors="replace") as fh:
+                    content = fh.read()
+                if "rate_limit_error" in content:
+                    rate_limited_uuids.append(debug_file.stem)
+                    if dry_run:
+                        print(f"  [dry-run] would delete {debug_file}")
+                    else:
+                        debug_file.unlink()
+                    matched += 1
+            except OSError:
+                skipped += 1
+
+    if rate_limited_uuids:
+        print(f"Identified {len(rate_limited_uuids)} rate-limited session(s)")
+
+    # 2. JSONL conversation logs — by UUID correlation
+    projects_dir = claude_dir / "projects"
+    if projects_dir.is_dir():
+        for session_uuid in rate_limited_uuids:
+            for jsonl_file in projects_dir.glob(f"*/{session_uuid}.jsonl"):
+                try:
+                    if dry_run:
+                        print(f"  [dry-run] would delete {jsonl_file}")
+                    else:
+                        jsonl_file.unlink()
+                    matched += 1
+                except OSError:
+                    skipped += 1
+
+    # 3. Todo stubs — by UUID correlation + 2-byte size guard
+    todos_dir = claude_dir / "todos"
+    if todos_dir.is_dir():
+        for session_uuid in rate_limited_uuids:
+            todo_file = todos_dir / f"{session_uuid}-agent-{session_uuid}.json"
+            try:
+                st = todo_file.stat()
+                if st.st_size <= 2:
+                    if dry_run:
+                        print(f"  [dry-run] would delete {todo_file}")
+                    else:
+                        todo_file.unlink()
+                    matched += 1
+            except OSError:
+                skipped += 1
+
+    # 4. Telemetry — by UUID correlation
+    telemetry_dir = claude_dir / "telemetry"
+    if telemetry_dir.is_dir():
+        for session_uuid in rate_limited_uuids:
+            for f in telemetry_dir.glob(f"1p_failed_events.{session_uuid}.*.json"):
+                try:
+                    if dry_run:
+                        print(f"  [dry-run] would delete {f}")
+                    else:
+                        f.unlink()
+                    matched += 1
+                except OSError:
+                    skipped += 1
+
+    action = "Would delete" if dry_run else "Deleted"
+    print(f"{action} {matched} rate-limit artifact(s)")
+    if skipped:
+        print(f"Skipped {skipped} file(s) due to errors")
     return 0
 
 
