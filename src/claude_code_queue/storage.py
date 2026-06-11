@@ -351,6 +351,11 @@ class QueueStorage:
             if prompt and prompt.id not in processed_ids:
                 prompt.status = PromptStatus.QUEUED
                 prompts.append(prompt)
+                # Dedupe within this pass too: a hand-created `{id}.md` and the
+                # canonical `{id}-{title}.md` parse to the same prompt ID. Without
+                # this, both load as separate prompts and their saves clobber each
+                # other's state (rate-limit parks, retry counts) every cycle.
+                processed_ids.add(prompt.id)
 
         return prompts
 
@@ -418,6 +423,17 @@ class QueueStorage:
                 file_path.unlink()
             except Exception as e:
                 print(f"Error removing file {file_path}: {e}")
+
+        # Also remove a bare `{id}.md` (hand-created, no `-{title}` suffix).
+        # The parser derives the same prompt ID from it, so leaving it behind
+        # resurrects a stale copy of the prompt on every reload. Exact-name
+        # match, so the prefix-collision concern above does not apply.
+        bare_file = directory / f"{prompt_id}.md"
+        if bare_file.exists():
+            try:
+                bare_file.unlink()
+            except Exception as e:
+                print(f"Error removing file {bare_file}: {e}")
 
     @staticmethod
     def _sanitize_filename_static(text: str) -> str:
