@@ -14,6 +14,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List, Tuple
+from zoneinfo import ZoneInfo
 
 from .models import ExecutionResult, RateLimitInfo, QueuedPrompt
 
@@ -467,6 +468,7 @@ class ClaudeCodeInterface:
             ("usage limit reached", self._extract_reset_time_from_limit_message),  # "usage limit reached|<ts>"
             ("exceeded your rate limit", self._estimate_reset_time),  # "you have exceeded your rate limit"
             ("reached your usage limit", self._estimate_reset_time),   # "you've/have reached your usage limit" (no apostrophe to avoid U+2019 mismatch)
+            ("hit your session limit", self._extract_reset_time_from_session_limit),  # "you've hit your session limit · resets 7am (Asia/Singapore)"
         ]
         # Broad patterns — safe for stderr (genuine Claude CLI messages appear at the
         # very start; the scan-window provides depth protection) but NOT safe for
@@ -551,6 +553,47 @@ class ClaudeCodeInterface:
             print(f"Error parsing reset time: {e}")
 
         return self._estimate_reset_time(output)
+
+    def _extract_reset_time_from_session_limit(self, output: str) -> Optional[datetime]:
+        """Extract reset time from a session-limit message.
+
+        Format: "You've hit your session limit · resets 7am (Asia/Singapore)"
+        Time may include minutes ("resets 7:30pm"); the timezone in parentheses
+        is an IANA name and may be absent. Falls back to the 5-hour-window
+        estimate when the message can't be parsed.
+        """
+        try:
+            match = re.search(
+                r"resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)(?:\s*\(([^)]+)\))?",
+                output,
+                re.IGNORECASE,
+            )
+            if not match:
+                return self._estimate_reset_time(output)
+
+            hour = int(match.group(1)) % 12
+            if match.group(3).lower() == "pm":
+                hour += 12
+            minute = int(match.group(2) or 0)
+
+            tz = None
+            if match.group(4):
+                try:
+                    tz = ZoneInfo(match.group(4).strip())
+                except Exception:
+                    pass  # unknown timezone name; treat the time as local
+
+            now = datetime.now(tz) if tz else datetime.now()
+            reset = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if reset <= now:
+                reset += timedelta(days=1)
+            if tz:
+                reset = reset.astimezone()  # convert to local before going naive
+
+            return ClaudeCodeInterface._cap_reset_time(reset)
+        except Exception as e:
+            print(f"Error parsing session-limit reset time: {e}")
+            return self._estimate_reset_time(output)
 
     def _estimate_reset_time(self, output: str) -> datetime:
         """Estimate reset time based on Claude's 5-hour windows."""
