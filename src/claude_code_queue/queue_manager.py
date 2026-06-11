@@ -163,9 +163,23 @@ class QueueManager:
                 p for p in self.state.prompts if p.status == PromptStatus.RATE_LIMITED
             ]
             if rate_limited_prompts:
-                print(
-                    f"Waiting for rate limit reset ({len(rate_limited_prompts)} prompts rate limited)"
-                )
+                reset_times = [
+                    p.reset_time for p in rate_limited_prompts if p.reset_time is not None
+                ]
+                if reset_times:
+                    soonest_reset = min(reset_times)
+                    remaining = max(0, int((soonest_reset - datetime.now()).total_seconds()))
+                    hours, rest = divmod(remaining, 3600)
+                    minutes = rest // 60
+                    print(
+                        f"Waiting for rate limit reset ({len(rate_limited_prompts)} prompt(s) rate limited, "
+                        f"next reset at {soonest_reset:%H:%M} — in {hours}h {minutes:02d}m)"
+                    )
+                else:
+                    print(
+                        f"Waiting for rate limit reset ({len(rate_limited_prompts)} prompt(s) rate limited, "
+                        f"no reset time parsed — retrying every 5 minutes)"
+                    )
             else:
                 now = datetime.now()
                 cooldown_prompts = [
@@ -320,7 +334,13 @@ class QueueManager:
 
             if not was_already_rate_limited and self.state is not None:
                 self.state.rate_limited_count += 1
-            print(f"⚠ Prompt {prompt.id} rate limited, will retry later")
+            if prompt.reset_time is not None:
+                print(
+                    f"⚠ Prompt {prompt.id} rate limited, will retry after reset at "
+                    f"{prompt.reset_time:%H:%M}"
+                )
+            else:
+                print(f"⚠ Prompt {prompt.id} rate limited, will retry in 5 minutes")
 
             self._cleanup_rate_limit_artifacts(prompt)
 
