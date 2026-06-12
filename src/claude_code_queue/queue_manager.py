@@ -40,6 +40,13 @@ class QueueManager:
                 file=sys.stderr,
             )
         self._generic_failure_retry_delay = max(1, generic_failure_retry_delay)
+        # Idle-wait coordination between _process_queue_iteration() and start():
+        # seconds until the next known actionable moment (rate-limit reset or
+        # retry cooldown expiry), or None when there is nothing to wait for.
+        self._idle_wait_seconds: Optional[float] = None
+        # Dedup key for the waiting message so it prints once per wait state
+        # instead of on every poll iteration.
+        self._last_wait_key: Optional[str] = None
 
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -93,7 +100,16 @@ class QueueManager:
                 did_work = self._process_queue_iteration(callback)
 
                 if self.running and not did_work:
-                    time.sleep(self.check_interval)
+                    # Sleep until the next known actionable moment (rate-limit
+                    # reset / cooldown expiry) so the retry lands exactly on it,
+                    # but never longer than check_interval — prompts added to the
+                    # queue directory mid-wait still get picked up promptly.
+                    sleep_seconds = self.check_interval
+                    if self._idle_wait_seconds is not None:
+                        sleep_seconds = min(
+                            self.check_interval, max(1.0, self._idle_wait_seconds)
+                        )
+                    time.sleep(sleep_seconds)
 
         except KeyboardInterrupt:
             # print() is safe: we are in normal execution context, not signal-handler
@@ -168,18 +184,28 @@ class QueueManager:
                 ]
                 if reset_times:
                     soonest_reset = min(reset_times)
-                    remaining = max(0, int((soonest_reset - datetime.now()).total_seconds()))
-                    hours, rest = divmod(remaining, 3600)
-                    minutes = rest // 60
-                    print(
-                        f"Waiting for rate limit reset ({len(rate_limited_prompts)} prompt(s) rate limited, "
-                        f"next reset at {soonest_reset:%H:%M} — in {hours}h {minutes:02d}m)"
-                    )
+                    remaining = max(0, (soonest_reset - datetime.now()).total_seconds())
+                    self._idle_wait_seconds = remaining
+                    # Print once per wait state (count + reset target), not per poll.
+                    wait_key = f"rl:{len(rate_limited_prompts)}:{soonest_reset:%Y-%m-%d %H:%M}"
+                    if wait_key != self._last_wait_key:
+                        self._last_wait_key = wait_key
+                        hours, rest = divmod(int(remaining), 3600)
+                        minutes = rest // 60
+                        print(
+                            f"Waiting for rate limit reset ({len(rate_limited_prompts)} prompt(s) rate limited, "
+                            f"next reset at {soonest_reset:%H:%M} — in {hours}h {minutes:02d}m; "
+                            f"sleeping until then, new prompts still picked up)"
+                        )
                 else:
-                    print(
-                        f"Waiting for rate limit reset ({len(rate_limited_prompts)} prompt(s) rate limited, "
-                        f"no reset time parsed — retrying every 5 minutes)"
-                    )
+                    self._idle_wait_seconds = None
+                    wait_key = f"rl-heuristic:{len(rate_limited_prompts)}"
+                    if wait_key != self._last_wait_key:
+                        self._last_wait_key = wait_key
+                        print(
+                            f"Waiting for rate limit reset ({len(rate_limited_prompts)} prompt(s) rate limited, "
+                            f"no reset time parsed — retrying every 5 minutes)"
+                        )
             else:
                 now = datetime.now()
                 cooldown_prompts = [
@@ -191,12 +217,19 @@ class QueueManager:
                 if cooldown_prompts:
                     soonest = min(p.retry_not_before for p in cooldown_prompts)
                     wait = max(0, (soonest - now).total_seconds())
-                    print(
-                        f"Waiting for retry cooldown ({len(cooldown_prompts)} prompt(s) in backoff, "
-                        f"next eligible in {max(1, int(wait))}s)"
-                    )
+                    self._idle_wait_seconds = wait
+                    wait_key = f"cooldown:{len(cooldown_prompts)}:{soonest:%H:%M:%S}"
+                    if wait_key != self._last_wait_key:
+                        self._last_wait_key = wait_key
+                        print(
+                            f"Waiting for retry cooldown ({len(cooldown_prompts)} prompt(s) in backoff, "
+                            f"next eligible in {max(1, int(wait))}s)"
+                        )
                 else:
-                    print("No prompts in queue")
+                    self._idle_wait_seconds = None
+                    if self._last_wait_key != "empty":
+                        self._last_wait_key = "empty"
+                        print("No prompts in queue")
 
             # Fix S8: _check_rate_limited_prompts() may have transitioned prompts to
             # FAILED. Save state so those transitions are persisted even when no prompt
@@ -206,6 +239,10 @@ class QueueManager:
             if callback:
                 callback(self.state)
             return False
+
+        # New work resets the wait-state dedup so the next wait announces itself.
+        self._last_wait_key = None
+        self._idle_wait_seconds = None
 
         print(f"Executing prompt {next_prompt.id}: {next_prompt.content[:50]}...")
         self._execute_prompt(next_prompt)
@@ -288,7 +325,15 @@ class QueueManager:
                 prompt.add_log(f"Output:\n{result.output}")
 
             self.state.total_processed += 1
-            print(f"✓ Prompt {prompt.id} completed successfully")
+            print(
+                f"✓ Prompt {prompt.id} completed successfully "
+                f"in {result.execution_time:.0f}s"
+            )
+            if result.output:
+                summary = result.output.strip()
+                if len(summary) > 1200:
+                    summary = summary[:1200].rstrip() + "\n… (truncated)"
+                print(f"--- Output ---\n{summary}\n--- (full output saved to completed/) ---")
 
         elif result.is_non_retryable:
             # Fix B — Non-retryable error: fail immediately, skip retry counter and can_retry().
