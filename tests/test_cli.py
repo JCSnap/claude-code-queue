@@ -1202,3 +1202,115 @@ class TestBatchVariables:
     def test_batch_variables_returns_0(self, tmp_path):
         code = self._run(tmp_path, "---\npriority: 0\n---\n\nProcess {{item}}")
         assert code == 0
+
+
+# ===========================================================================
+# Cleanup Command
+# ===========================================================================
+
+class TestCleanup:
+    """Tests for `claude-queue cleanup [--dry-run]`."""
+
+    def _make_artifacts(self, tmp_path, session_uuid="aaa-bbb-ccc"):
+        """Create fake rate-limit artifacts under tmp_path/.claude/."""
+        claude_dir = tmp_path / ".claude"
+        debug_dir = claude_dir / "debug"
+        projects_dir = claude_dir / "projects" / "-home-testuser-project"
+        todos_dir = claude_dir / "todos"
+        telemetry_dir = claude_dir / "telemetry"
+        for d in (debug_dir, projects_dir, todos_dir, telemetry_dir):
+            d.mkdir(parents=True)
+
+        # Debug file with rate_limit_error content
+        debug_file = debug_dir / f"{session_uuid}.txt"
+        debug_file.write_text("startup\nrate_limit_error\n")
+
+        # Correlated JSONL
+        jsonl_file = projects_dir / f"{session_uuid}.jsonl"
+        jsonl_file.write_bytes(b"x" * 5000)
+
+        # Correlated todo stub
+        todo_file = todos_dir / f"{session_uuid}-agent-{session_uuid}.json"
+        todo_file.write_text("[]")
+
+        # Correlated telemetry file
+        telemetry_file = telemetry_dir / f"1p_failed_events.{session_uuid}.other-uuid.json"
+        telemetry_file.write_text('{"events": []}')
+
+        return debug_file, jsonl_file, todo_file, telemetry_file
+
+    def test_cleanup_dry_run_does_not_delete(self, tmp_path, capsys):
+        debug_file, jsonl_file, todo_file, telemetry_file = self._make_artifacts(tmp_path)
+
+        with patch("sys.argv", ["claude-queue", "cleanup", "--dry-run"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 0
+        assert debug_file.exists(), "dry-run must not delete files"
+        assert jsonl_file.exists()
+        assert todo_file.exists()
+        assert telemetry_file.exists()
+        out = capsys.readouterr().out
+        assert "Would delete" in out
+        assert "dry-run" in out
+
+    def test_cleanup_deletes_artifacts(self, tmp_path, capsys):
+        debug_file, jsonl_file, todo_file, telemetry_file = self._make_artifacts(tmp_path)
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 0
+        assert not debug_file.exists()
+        assert not jsonl_file.exists()
+        assert not todo_file.exists()
+        assert not telemetry_file.exists()
+        out = capsys.readouterr().out
+        assert "Deleted 4 rate-limit artifact(s)" in out
+
+    def test_cleanup_preserves_non_rate_limited_debug(self, tmp_path, capsys):
+        """Debug files without rate_limit_error are not deleted."""
+        claude_dir = tmp_path / ".claude"
+        debug_dir = claude_dir / "debug"
+        debug_dir.mkdir(parents=True)
+
+        good_file = debug_dir / "good-session.txt"
+        good_file.write_text("startup\nall good\nstream completed\n")
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 0
+        assert good_file.exists()
+        assert "Deleted 0" in capsys.readouterr().out
+
+    def test_cleanup_preserves_real_todo_file(self, tmp_path, capsys):
+        """Todo files > 2 bytes are preserved even if UUID matches a rate-limited session."""
+        debug_file, jsonl_file, todo_file, telemetry_file = self._make_artifacts(tmp_path)
+        # Overwrite the stub with realistic todo content (> 2 bytes)
+        todo_file.write_text('[{"task": "implement feature", "status": "in_progress"}]')
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 0
+        assert todo_file.exists(), "real todo file (> 2 bytes) must be preserved"
+        assert not debug_file.exists()
+        assert not jsonl_file.exists()
+        # 3 deleted: debug + jsonl + telemetry (todo preserved by size guard)
+        assert "Deleted 3" in capsys.readouterr().out
+
+    def test_cleanup_handles_empty_claude_dir(self, tmp_path, capsys):
+        """Cleanup succeeds when ~/.claude/ has no artifact directories."""
+        (tmp_path / ".claude").mkdir()
+
+        with patch("sys.argv", ["claude-queue", "cleanup"]):
+            with patch("pathlib.Path.home", return_value=tmp_path):
+                code = main()
+
+        assert code == 0
+        assert "Deleted 0" in capsys.readouterr().out
