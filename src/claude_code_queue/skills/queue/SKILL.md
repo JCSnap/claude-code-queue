@@ -63,6 +63,7 @@ context_files:
   - tests/test_relevant.py
 max_retries: 3
 estimated_tokens: null
+model: null
 ---
 
 # Task Title
@@ -88,6 +89,7 @@ What should be delivered when done.
 | `context_files` | Paths relative to `working_directory`. Only include files that exist. |
 | `max_retries` | Total attempts: `3` = 3 total, `-1` = unlimited, `1` = no retry. Rate-limit retries and failures share this counter. |
 | `estimated_tokens` | Optional hint; set `null` if unknown. |
+| `model` | Claude model ID (e.g. `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`). Omit or set `null` to use the default. |
 
 ### Priority Guidelines
 

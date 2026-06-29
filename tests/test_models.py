@@ -50,6 +50,23 @@ def test_add_log_is_cumulative():  # MOD-003
 
 
 # ===========================================================================
+# QueuedPrompt — model field
+# ===========================================================================
+
+
+def test_prompt_model_default_is_none():  # MOD-029
+    """QueuedPrompt defaults model to None."""
+    p = QueuedPrompt(content="test")
+    assert p.model is None
+
+
+def test_prompt_model_accepts_string():  # MOD-030
+    """model field stores an arbitrary string model ID."""
+    p = QueuedPrompt(content="test", model="claude-haiku-4-5-20251001")
+    assert p.model == "claude-haiku-4-5-20251001"
+
+
+# ===========================================================================
 # QueuedPrompt — should_execute_now()
 # ===========================================================================
 

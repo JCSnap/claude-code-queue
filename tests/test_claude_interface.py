@@ -307,6 +307,42 @@ def test_execute_prompt_includes_dangerously_skip_permissions(interface):  # CLI
         assert "--dangerously-skip-permissions" in args
 
 
+def test_execute_prompt_includes_model_flag_when_set(interface):  # CLI-060
+    """When prompt.model is set, --model <value> appears in the subprocess command."""
+    mock_proc = make_mock_proc()
+    with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+        prompt = QueuedPrompt(content="task", model="claude-haiku-4-5-20251001")
+        interface.execute_prompt(prompt)
+        args = mock_popen.call_args[0][0]
+        assert "--model" in args
+        model_idx = args.index("--model")
+        assert args[model_idx + 1] == "claude-haiku-4-5-20251001"
+
+
+def test_execute_prompt_omits_model_flag_when_none(interface):  # CLI-061
+    """When prompt.model is None, no --model flag is added."""
+    mock_proc = make_mock_proc()
+    with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+        prompt = QueuedPrompt(content="task", model=None)
+        interface.execute_prompt(prompt)
+        args = mock_popen.call_args[0][0]
+        assert "--model" not in args
+
+
+def test_execute_prompt_model_flag_before_prompt_arg(interface):  # CLI-062
+    """--model flag is placed before the positional prompt argument."""
+    mock_proc = make_mock_proc()
+    with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+        prompt = QueuedPrompt(content="my task", model="claude-opus-4-6")
+        interface.execute_prompt(prompt)
+        args = mock_popen.call_args[0][0]
+        model_idx = args.index("--model")
+        prompt_idx = args.index("my task")
+        assert model_idx < prompt_idx, (
+            f"--model at {model_idx} must precede prompt at {prompt_idx}"
+        )
+
+
 def test_execute_prompt_success_returns_success_result(interface):  # CLI-026
     """returncode=0 with no rate-limit output → success=True."""
     mock_proc = make_mock_proc(returncode=0, stdout="All done", stderr="")
