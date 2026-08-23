@@ -1185,6 +1185,16 @@ class TestBatchValidate:
         assert code == 1
         assert "Error" in capsys.readouterr().out
 
+    def test_batch_validate_rejects_ragged_csv(self, tmp_path, capsys):
+        code = self._run(
+            tmp_path,
+            "---\npriority: 0\n---\n\nHello {{name}} {{age}}",
+            "name,age\nalice\n",
+        )
+
+        assert code == 1
+        assert "row 2 has fewer values" in capsys.readouterr().out
+
     def test_batch_validate_data_file_not_found(self, tmp_path, capsys):
         template_file = tmp_path / "t.md"
         template_file.write_text("hello")
@@ -1573,7 +1583,6 @@ class TestCleanup:
         assert retry_code == 0
         assert not debug_file.exists()
         assert not jsonl_file.exists()
-
     def test_cleanup_does_not_follow_symlinked_project_child(self, tmp_path):
         debug_file, jsonl_file, todo_file, telemetry_file = self._make_artifacts(tmp_path)
         project_dir = jsonl_file.parent

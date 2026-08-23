@@ -134,7 +134,7 @@ Examples:
   # Test Claude Code connection
   python -m claude_code_queue.cli test
 
-  # Install the Claude Code /queue skill
+  # Install all bundled Claude Code skills
   python -m claude_code_queue.cli install-skill
         """,
     )
@@ -375,7 +375,12 @@ Examples:
     # Install skill subcommand
     install_skill_parser = subparsers.add_parser(
         "install-skill",
-        help="Install the Claude Code skill into the active profile's skills/ directory",
+        help="Install bundled Claude Code skills into the active profile",
+    )
+    install_skill_parser.add_argument(
+        "skill_name",
+        nargs="?",
+        help="Skill to install (default: all bundled skills)",
     )
     install_skill_parser.add_argument(
         "--force", action="store_true", help="Overwrite existing skill file"
@@ -995,7 +1000,11 @@ def cmd_batch_validate(args) -> int:
 
     template_text = template_path.read_text(encoding="utf-8")
     template_vars = extract_variables(template_text)
-    columns, rows = read_data_file(data_path)
+    try:
+        columns, rows = read_data_file(data_path)
+    except (ValueError, OSError) as e:
+        print(f"Error: {e}")
+        return 1
     errors, warnings = validate_batch(template_vars, columns)
 
     print(f"Template: {template_path}")
@@ -1043,27 +1052,82 @@ def cmd_batch_variables(args) -> int:
 
 
 def cmd_install_skill(args) -> int:
-    """Install the Claude Code skill into the active profile's skills/queue/SKILL.md.
-
-    The destination follows $CLAUDE_CONFIG_DIR, so each Claude Code profile gets
-    its own copy rather than every install landing in ~/.claude.
-    """
-    dest = claude_config_dir() / "skills" / "queue" / "SKILL.md"
-    skill_src = Path(__file__).parent / "skills" / "queue" / "SKILL.md"
-
-    if not skill_src.exists():
-        print("Error: bundled SKILL.md not found in package installation.")
+    """Install one or all bundled skills into the active Claude profile."""
+    skills_pkg_dir = Path(__file__).parent / "skills"
+    if not skills_pkg_dir.is_dir():
+        print("Error: bundled skills directory not found in package installation.")
         return 1
 
-    if dest.exists() and not args.force:
-        print(f"Skill already installed at {dest}")
+    try:
+        bundled = {
+            path.name: path / "SKILL.md"
+            for path in sorted(skills_pkg_dir.iterdir())
+            if path.is_dir() and (path / "SKILL.md").is_file()
+        }
+    except OSError as e:
+        print(f"Error: could not read bundled skills: {e}")
+        return 1
+
+    if not bundled:
+        print("Error: no bundled skills found in package installation.")
+        return 1
+
+    skill_name = getattr(args, "skill_name", None)
+    if skill_name and skill_name not in bundled:
+        print(f"Error: unknown bundled skill '{skill_name}'.")
+        print(f"Available skills: {', '.join(bundled)}")
+        return 1
+
+    selected = [skill_name] if skill_name else list(bundled)
+    skills_dir = claude_config_dir() / "skills"
+    destinations = {name: skills_dir / name / "SKILL.md" for name in selected}
+
+    conflicts = [dest for dest in destinations.values() if dest.exists()]
+    if conflicts and not args.force:
+        for dest in conflicts:
+            print(f"Skill already installed at {dest}")
         print("Use --force to overwrite.")
         return 1
 
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(skill_src.read_text(encoding="utf-8"), encoding="utf-8")
-    print(f"Skill installed to {dest}")
-    print("Restart Claude Code for the /queue skill to become available.")
+    try:
+        contents = {
+            name: bundled[name].read_text(encoding="utf-8") for name in selected
+        }
+    except OSError as e:
+        print(f"Error: could not read bundled skill: {e}")
+        return 1
+
+    try:
+        originals = {
+            name: dest.read_bytes() if dest.exists() else None
+            for name, dest in destinations.items()
+        }
+    except OSError as e:
+        print(f"Error: could not read installed skill: {e}")
+        return 1
+    written = []
+    try:
+        for name, dest in destinations.items():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            written.append(name)
+            dest.write_text(contents[name], encoding="utf-8")
+    except OSError as e:
+        for name in reversed(written):
+            dest = destinations[name]
+            original = originals[name]
+            try:
+                if original is None:
+                    dest.unlink(missing_ok=True)
+                else:
+                    dest.write_bytes(original)
+            except OSError:
+                pass
+        print(f"Error: could not install bundled skills: {e}")
+        return 1
+
+    for dest in destinations.values():
+        print(f"Skill installed to {dest}")
+    print("Restart Claude Code for the installed skills to become available.")
     return 0
 
 

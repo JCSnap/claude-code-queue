@@ -35,6 +35,8 @@ SKILL_PATH = (
     / "SKILL.md"
 )
 
+BATCH_SKILL_PATH = SKILL_PATH.parent.parent / "batch-wizard" / "SKILL.md"
+
 # Known CLI subcommands registered in cli.py.
 _CLI_SUBCOMMANDS = {
     "start", "add", "template", "status", "cancel",
@@ -93,6 +95,17 @@ class TestSkillFileStructure:
         tools = skill_frontmatter["allowed-tools"]
         tool_str = " ".join(tools) if isinstance(tools, list) else str(tools)
         assert "Bash" in tool_str
+
+
+    def test_batch_wizard_has_minimal_required_tools(self):
+        """The wizard declares only the tools used by its workflow."""
+        parts = BATCH_SKILL_PATH.read_text(encoding="utf-8").split("---\n", 2)
+        frontmatter = yaml.safe_load(parts[1])
+
+        assert frontmatter["name"] == "batch-wizard"
+        assert frontmatter["allowed-tools"] == [
+            "Bash", "Read", "Glob", "Grep", "Write", "Edit", "Agent"
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -208,8 +221,8 @@ class TestInstallSkillCommand:
             return main()
 
     @staticmethod
-    def _dest(home: Path) -> Path:
-        return home / ".claude" / "skills" / "queue" / "SKILL.md"
+    def _dest(home: Path, name: str = "queue") -> Path:
+        return home / ".claude" / "skills" / name / "SKILL.md"
 
     def test_sk019_installs_into_the_active_profile(self, tmp_path, monkeypatch):
         """SK-019: the destination follows CLAUDE_CONFIG_DIR.
@@ -308,3 +321,64 @@ class TestInstallSkillCommand:
         self._run()
         out = capsys.readouterr().out
         assert "not found" in out.lower() or "error" in out.lower()
+    def test_default_install_writes_every_bundled_skill(self, skill_home):
+        assert self._run() == 0
+        assert self._dest(skill_home, "queue").exists()
+        assert self._dest(skill_home, "batch-wizard").exists()
+
+    @pytest.mark.parametrize("name", ["queue", "batch-wizard"])
+    def test_named_install_writes_only_selected_skill(self, skill_home, name):
+        assert self._run(name) == 0
+        assert self._dest(skill_home, name).exists()
+        other = "batch-wizard" if name == "queue" else "queue"
+        assert not self._dest(skill_home, other).exists()
+
+    def test_unknown_skill_returns_stable_error(self, skill_home, capsys):
+        assert self._run("missing") == 1
+        output = capsys.readouterr().out
+        assert "unknown bundled skill 'missing'" in output
+        assert "batch-wizard, queue" in output
+
+    def test_existing_skill_prevents_partial_install(self, skill_home):
+        queue_dest = self._dest(skill_home)
+        queue_dest.parent.mkdir(parents=True)
+        queue_dest.write_text("custom", encoding="utf-8")
+
+        assert self._run() == 1
+        assert queue_dest.read_text(encoding="utf-8") == "custom"
+        assert not self._dest(skill_home, "batch-wizard").exists()
+
+    def test_force_updates_every_bundled_skill(self, skill_home):
+        for name in ("queue", "batch-wizard"):
+            dest = self._dest(skill_home, name)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text("stale", encoding="utf-8")
+
+        assert self._run("--force") == 0
+        assert self._dest(skill_home).read_text(
+            encoding="utf-8"
+        ) == SKILL_PATH.read_text(encoding="utf-8")
+        assert self._dest(skill_home, "batch-wizard").read_text(
+            encoding="utf-8"
+        ) == BATCH_SKILL_PATH.read_text(encoding="utf-8")
+
+    def test_write_failure_rolls_back_new_files(self, skill_home):
+        original_write_text = Path.write_text
+
+        def fail_batch_write(path, data, *args, **kwargs):
+            if path.parent.name == "batch-wizard":
+                raise OSError("disk full")
+            return original_write_text(path, data, *args, **kwargs)
+
+        with patch.object(Path, "write_text", autospec=True, side_effect=fail_batch_write):
+            assert self._run() == 1
+
+        assert not self._dest(skill_home).exists()
+        assert not self._dest(skill_home, "batch-wizard").exists()
+
+    def test_relative_active_profile_is_resolved(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "profile")
+
+        assert self._run("batch-wizard") == 0
+        assert (tmp_path / "profile" / "skills" / "batch-wizard" / "SKILL.md").exists()

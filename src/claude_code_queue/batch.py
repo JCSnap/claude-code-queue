@@ -17,6 +17,7 @@ from .models import QueuedPrompt, PromptStatus
 from .storage import MarkdownPromptParser, QueueStorage
 
 VARIABLE_PATTERN = re.compile(r"\{\{(\w+)\}\}")
+GENERATED_ID_PATTERN = re.compile(r"^([0-9a-f]{8})(?:-|\.md$)", re.IGNORECASE)
 
 
 def extract_variables(text: str) -> Set[str]:
@@ -59,7 +60,42 @@ def read_data_file(data_path: Path) -> Tuple[List[str], List[Dict[str, str]]]:
         columns = reader.fieldnames or []
         rows = list(reader)
 
+    if any(not column for column in columns):
+        raise ValueError("Data file contains an empty column name")
+    if len(columns) != len(set(columns)):
+        raise ValueError("Data file contains duplicate column names")
+
+    for row_number, row in enumerate(rows, start=2):
+        if row.get(None):
+            raise ValueError(f"Data row {row_number} has more values than the header")
+        missing = [column for column in columns if row.get(column) is None]
+        if missing:
+            raise ValueError(
+                f"Data row {row_number} has fewer values than the header: {missing}"
+            )
+
     return columns, rows
+
+
+def _existing_generated_ids(storage: QueueStorage) -> Set[str]:
+    """Return generated ID prefixes already used in queue storage."""
+    existing = set()
+    for directory in (storage.queue_dir, storage.completed_dir, storage.failed_dir):
+        for path in directory.glob("*.md"):
+            match = GENERATED_ID_PATTERN.match(path.name)
+            if match:
+                existing.add(match.group(1).lower())
+    return existing
+
+
+def _allocate_generated_id(reserved: Set[str]) -> str:
+    """Allocate an unused eight-character UUID prefix."""
+    for _ in range(100):
+        candidate = str(uuid.uuid4())[:8]
+        if candidate not in reserved:
+            reserved.add(candidate)
+            return candidate
+    raise ValueError("Could not allocate a unique job ID after 100 attempts")
 
 
 def validate_batch(
@@ -142,6 +178,7 @@ def generate_batch_jobs(
 
     prompts = []
     parser = MarkdownPromptParser()
+    reserved_ids = _existing_generated_ids(storage)
 
     for i, row in enumerate(rows):
         rendered = render_template(template_text, row)
@@ -162,7 +199,7 @@ def generate_batch_jobs(
             raise ValueError(f"Failed to parse rendered template for row {i + 1}: {row}")
 
         # Fresh identity for each generated job
-        prompt.id = str(uuid.uuid4())[:8]
+        prompt.id = _allocate_generated_id(reserved_ids)
         prompt.status = PromptStatus.QUEUED
         prompt.created_at = datetime.now()
         prompt.retry_count = 0
@@ -176,7 +213,8 @@ def generate_batch_jobs(
             prompt.priority = base_priority + i * priority_step
 
         if not dry_run:
-            storage._save_single_prompt(prompt)
+            if not storage._save_single_prompt(prompt):
+                raise ValueError(f"Failed to save generated job for data row {i + 2}")
 
         prompts.append(prompt)
 

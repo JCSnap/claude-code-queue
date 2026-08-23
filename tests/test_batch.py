@@ -160,6 +160,29 @@ class TestReadDataFile:
         assert rows[0]["name"] == "alice"
 
 
+    def test_rejects_row_with_missing_value(self, tmp_path):
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("name,age\nalice\n")
+
+        with pytest.raises(ValueError, match="row 2 has fewer values"):
+            read_data_file(csv_file)
+
+    def test_rejects_row_with_extra_value(self, tmp_path):
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("name,age\nalice,30,extra\n")
+
+        with pytest.raises(ValueError, match="row 2 has more values"):
+            read_data_file(csv_file)
+
+    @pytest.mark.parametrize("header", ["name,", "name,name"])
+    def test_rejects_ambiguous_header(self, tmp_path, header):
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text(f"{header}\nalice,30\n")
+
+        with pytest.raises(ValueError, match="column name"):
+            read_data_file(csv_file)
+
+
 # --- validate_batch ---
 
 
@@ -282,6 +305,39 @@ class TestGenerateBatchJobs:
         prompts = generate_batch_jobs(template_path, csv_path, storage)
         ids = [p.id for p in prompts]
         assert len(set(ids)) == 3  # all unique
+
+    def test_uuid_prefix_collision_retries_without_overwriting(self, tmp_path):
+        storage = QueueStorage(storage_dir=str(tmp_path / "storage"))
+        existing = storage.queue_dir / "aaaaaaaa-existing.md"
+        existing.write_text("existing", encoding="utf-8")
+        template_path, csv_path = self._make_template_and_csv(
+            tmp_path,
+            TEMPLATE_CONTENT,
+            "project,filename\na,x.h\nb,y.h\n",
+        )
+
+        generated = [
+            "aaaaaaaa-0000-0000-0000-000000000000",
+            "bbbbbbbb-0000-0000-0000-000000000000",
+            "bbbbbbbb-1111-1111-1111-111111111111",
+            "cccccccc-0000-0000-0000-000000000000",
+        ]
+        with patch("claude_code_queue.batch.uuid.uuid4", side_effect=generated):
+            prompts = generate_batch_jobs(template_path, csv_path, storage)
+
+        assert [prompt.id for prompt in prompts] == ["bbbbbbbb", "cccccccc"]
+        assert existing.read_text(encoding="utf-8") == "existing"
+        assert len(list(storage.queue_dir.glob("*.md"))) == 3
+
+    def test_save_failure_is_reported(self, tmp_path):
+        storage = QueueStorage(storage_dir=str(tmp_path / "storage"))
+        template_path, csv_path = self._make_template_and_csv(
+            tmp_path, TEMPLATE_CONTENT, "project,filename\na,x.h\n"
+        )
+
+        with patch.object(storage, "_save_single_prompt", return_value=False):
+            with pytest.raises(ValueError, match="data row 2"):
+                generate_batch_jobs(template_path, csv_path, storage)
 
     def test_default_priority_from_template(self, tmp_path):
         storage = QueueStorage(storage_dir=str(tmp_path / "storage"))

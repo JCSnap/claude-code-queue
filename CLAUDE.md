@@ -302,5 +302,5 @@ usage_high_water: null   # cumulative usage already reported by this prompt
 | `bank save/list/use/delete` | Template bank ops | No |
 | `batch generate/validate/variables` | Batch job generation | No |
 | `cleanup [--dry-run]` | Remove rate-limit artifacts from the active Claude profile | No |
-| `install-skill [--force]` | Copy SKILL.md to ~/.claude/skills/ | No |
+| `install-skill [skill-name] [--force]` | Install bundled skills in the active Claude profile | No |
 | `prompt-box` | Launch Rust TUI | No (needs Rust binary) |
